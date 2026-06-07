@@ -30,8 +30,8 @@ typedef struct
     int16_t  speed_i_term_deg_x100;
     int16_t  pitch_meas_deg_x100;
     int16_t  pitch_rate_dps_x100;
-    int16_t  speed_target_radps_x1000;
-    int16_t  speed_meas_radps_x1000;
+    int16_t  speed_target_radps_x100;
+    int16_t  speed_meas_radps_x100;
     int16_t  attitude_p_term_ma;
     int16_t  attitude_d_term_ma;
     int16_t  iq_cmd_ma;
@@ -44,6 +44,7 @@ typedef struct
     int16_t  uq_r_mv;
     uint16_t bus_mv;
     uint16_t fault_flags;
+    int16_t  speed_raw_radps_x100;
 } DebugLink_StatusSnapshot_t;
 
 void DebugLink_Init(void);

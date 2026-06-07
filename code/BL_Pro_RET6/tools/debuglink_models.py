@@ -20,6 +20,7 @@ class LiveFrame:
     pitch_rate_dps: float
     speed_target_radps: float
     speed_meas_radps: float
+    speed_raw_radps: float
     attitude_p_iq_cmd_a: float
     attitude_d_iq_cmd_a: float
     iq_cmd_a: float

@@ -49,7 +49,18 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-static uint32_t g_icm_last_print_ms = 0U;
+static int16_t Main_ScaleToI16Clamped(float value, float scale)
+{
+  float scaled;
+
+  scaled = value * scale;
+  if (scaled > 32767.0f) {
+    scaled = 32767.0f;
+  } else if (scaled < -32768.0f) {
+    scaled = -32768.0f;
+  }
+  return (int16_t)scaled;
+}
 
 /* USER CODE END PV */
 
@@ -134,7 +145,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-
+    
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -154,8 +165,8 @@ int main(void)
         st.speed_i_term_deg_x100    = (int16_t)(att_telem.speed_i_term_rad * 5729.578f);
         st.pitch_meas_deg_x100      = (int16_t)(att_telem.pitch_meas_rad * 5729.578f);
         st.pitch_rate_dps_x100      = (int16_t)(att_telem.pitch_rate_meas_radps * 5729.578f);
-        st.speed_target_radps_x1000 = (int16_t)(att_telem.speed_target_radps * 1000.0f);
-        st.speed_meas_radps_x1000   = (int16_t)(att_telem.speed_meas_radps * 1000.0f);
+        st.speed_target_radps_x100  = Main_ScaleToI16Clamped(att_telem.speed_target_radps, 100.0f);
+        st.speed_meas_radps_x100    = Main_ScaleToI16Clamped(att_telem.speed_meas_radps, 100.0f);
         st.attitude_p_term_ma     = (int16_t)(att_telem.attitude_p_term_a * 1000.0f);
         st.attitude_d_term_ma     = (int16_t)(att_telem.attitude_d_term_a * 1000.0f);
         st.iq_cmd_ma                = (int16_t)(att_telem.iq_cmd_a * 1000.0f);
@@ -168,6 +179,7 @@ int main(void)
         st.uq_r_mv                  = (int16_t)(foc_telem.uq_right_v * 1000.0f);
         st.bus_mv                   = (uint16_t)(foc_telem.bus_voltage_v * 1000.0f);
         st.fault_flags              = foc_telem.status_flags;
+        st.speed_raw_radps_x100     = Main_ScaleToI16Clamped(att_telem.speed_raw_radps, 100.0f);
         DebugLink_UpdateStatusSnapshot(&st);
     }
 

@@ -45,7 +45,12 @@ static void process_pid_update_motor_holdoff(void)
 
     if ((int32_t)(HAL_GetTick() - pid_update_motor_reenable_tick) >= 0)
     {
-        HAL_GPIO_WritePin(Motor_EN_GPIO_Port, Motor_EN_Pin, GPIO_PIN_RESET);
+        if (App_FOC_SetDriverGateEnabled(1U) == 0U) {
+            pid_update_motor_reenable_tick = HAL_GetTick() + 50U;
+            USB_Debug_Printf("# WARN: driver gate re-enable deferred\r\n");
+            return;
+        }
+
         pid_update_motor_holdoff_active = 0U;
         USB_Debug_Printf("# Motor driver re-enabled after command update holdoff\r\n");
         App_ResetSpeedPIDs();
@@ -68,11 +73,16 @@ static void process_pid_update_motor_holdoff(void)
     }
 }
 
-static void trigger_pid_update_motor_holdoff(void)
+static uint8_t trigger_pid_update_motor_holdoff(void)
 {
-    HAL_GPIO_WritePin(Motor_EN_GPIO_Port, Motor_EN_Pin, GPIO_PIN_SET);
+    if (App_FOC_SetDriverGateEnabled(0U) == 0U) {
+        USB_Debug_Printf("# WARN: failed to disable driver gate for holdoff\r\n");
+        return 0U;
+    }
+
     pid_update_motor_holdoff_active = 1U;
     pid_update_motor_reenable_tick = HAL_GetTick() + PID_UPDATE_MOTOR_HOLDOFF_MS;
+    return 1U;
 }
 
 static void apply_pid_and_ack(float kp, float ki, float kd, float ilim)
@@ -101,7 +111,10 @@ static void apply_pid_and_ack(float kp, float ki, float kd, float ilim)
 
     /* 支持可选更新积分限幅；并清状态避免突变 */
     App_CurrentPID_SetSame(kp, ki, kd, final_ilim);
-    trigger_pid_update_motor_holdoff();
+    if (trigger_pid_update_motor_holdoff() == 0U) {
+        USB_Debug_Printf("# WARN: PID applied, but driver-gate holdoff not entered\r\n");
+        return;
+    }
     pid_update_ack_kp = kp;
     pid_update_ack_ki = ki;
     pid_update_ack_kd = kd;

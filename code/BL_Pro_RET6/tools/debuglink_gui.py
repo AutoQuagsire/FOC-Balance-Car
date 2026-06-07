@@ -8,12 +8,13 @@ local UI-only rendering.
 from __future__ import annotations
 
 import math
+import os
 import random
 import sys
 import csv
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,11 +25,62 @@ from debuglink_models import (
 )
 from debuglink_transport import DebugLinkTransport, TransportError
 
+
+_DLL_DIR_HANDLES: list[Any] = []
+
+
+def _prepare_windows_qt_dll_search_path() -> None:
+    if os.name != "nt":
+        return
+    if not hasattr(os, "add_dll_directory"):
+        return
+
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        mp = Path(meipass)
+        candidates.extend(
+            [
+                mp,
+                mp / "PySide6",
+                mp / "shiboken6",
+                mp / "_internal",
+                mp / "_internal" / "PySide6",
+                mp / "_internal" / "shiboken6",
+            ]
+        )
+
+    # Source-run fallback: ensure site-package bin dirs are visible.
+    try:
+        import PySide6  # type: ignore
+
+        pyside_dir = Path(PySide6.__file__).resolve().parent
+        candidates.extend([pyside_dir, pyside_dir / "plugins"])
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    for p in candidates:
+        pstr = str(p)
+        if pstr in seen:
+            continue
+        seen.add(pstr)
+        if p.exists():
+            try:
+                _DLL_DIR_HANDLES.append(os.add_dll_directory(pstr))
+            except Exception:
+                pass
+
+
+_prepare_windows_qt_dll_search_path()
+
 try:
     from PySide6.QtCore import QObject, QTimer, Signal
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
+        QComboBox,
+        QDoubleSpinBox,
         QFormLayout,
         QGridLayout,
         QGroupBox,
@@ -53,6 +105,12 @@ class LiveViewState:
     last_frame: LiveFrame | None = None
     paused: bool = False
     history_limit: int = 2000
+    recording: bool = False
+    record_duration_s: float = 5.0
+    record_deadline_monotonic: float = 0.0
+    record_rows: list[LiveFrame] = field(default_factory=list)
+    record_auto_started_stream: bool = False
+    record_output_path: str | None = None
 
 
 @dataclass
@@ -172,9 +230,11 @@ class MainWindow(QMainWindow):
         self.live_mode = QLabel("standby")
         self.live_stream = QLabel("stopped")
         self.live_rate = QLabel("-")
+        self.live_record = QLabel("idle")
         session_form.addRow("mode", self.live_mode)
         session_form.addRow("stream", self.live_stream)
         session_form.addRow("rate_hz", self.live_rate)
+        session_form.addRow("record", self.live_record)
         layout.addWidget(session_box)
 
         live_actions = QHBoxLayout()
@@ -183,6 +243,12 @@ class MainWindow(QMainWindow):
         self.btn_stream_start = QPushButton("Start Stream")
         self.btn_stream_stop = QPushButton("Stop Stream")
         self.btn_pause_view = QPushButton("Pause View")
+        self.record_duration_spin = QDoubleSpinBox()
+        self.record_duration_spin.setRange(1.0, 60.0)
+        self.record_duration_spin.setSingleStep(0.5)
+        self.record_duration_spin.setValue(self.live_state.record_duration_s)
+        self.record_duration_spin.setSuffix(" s")
+        self.btn_stream_record = QPushButton("Record Stream CSV")
         for btn in (
             self.btn_connect,
             self.btn_disconnect,
@@ -191,6 +257,9 @@ class MainWindow(QMainWindow):
             self.btn_pause_view,
         ):
             live_actions.addWidget(btn)
+        live_actions.addWidget(QLabel("Record"))
+        live_actions.addWidget(self.record_duration_spin)
+        live_actions.addWidget(self.btn_stream_record)
         live_actions.addStretch(1)
         layout.addLayout(live_actions)
 
@@ -212,6 +281,7 @@ class MainWindow(QMainWindow):
             "pitch_rate_dps",
             "speed_target_radps",
             "speed_meas_radps",
+            "speed_raw_radps",
             "speed_p_term_deg",
             "speed_i_term_deg",
             "iq_cmd_a",
@@ -303,13 +373,126 @@ class MainWindow(QMainWindow):
 
         session_box = QGroupBox("Session Defaults")
         session_form = QFormLayout(session_box)
+        port_row = QHBoxLayout()
+        self.ctrl_port_combo = QComboBox()
+        self.ctrl_port_combo.setEditable(True)
+        self.btn_refresh_ports = QPushButton("Refresh Ports")
+        port_row.addWidget(self.ctrl_port_combo)
+        port_row.addWidget(self.btn_refresh_ports)
         self.ctrl_rate_spin = QSpinBox()
-        self.ctrl_rate_spin.setRange(1, 500)
+        self.ctrl_rate_spin.setRange(1, 200)
         self.ctrl_rate_spin.setValue(100)
         self.ctrl_mock_checkbox = QCheckBox("Mock mode")
+        session_form.addRow("serial_port", port_row)
         session_form.addRow("stream_rate_hz", self.ctrl_rate_spin)
         session_form.addRow("options", self.ctrl_mock_checkbox)
         layout.addWidget(session_box)
+
+        speed_box = QGroupBox("Speed Loop")
+        speed_form = QFormLayout(speed_box)
+        self.speed_kp_spin = QDoubleSpinBox()
+        self.speed_kp_spin.setRange(0.0, 1.0)
+        self.speed_kp_spin.setDecimals(6)
+        self.speed_kp_spin.setSingleStep(0.001)
+        self.speed_kp_spin.setValue(0.0015)
+        self.speed_kp_spin.setToolTip("Speed loop Kp in rad/radps. Use 0.000000 to disable P.")
+        speed_kp_row = QHBoxLayout()
+        self.btn_speed_kp_read = QPushButton("Read Kp")
+        self.btn_speed_kp_apply = QPushButton("Apply Kp")
+        speed_kp_row.addWidget(self.speed_kp_spin)
+        speed_kp_row.addWidget(self.btn_speed_kp_read)
+        speed_kp_row.addWidget(self.btn_speed_kp_apply)
+        speed_form.addRow("speed_kp_rad_per_radps", speed_kp_row)
+
+        self.speed_ki_spin = QDoubleSpinBox()
+        self.speed_ki_spin.setRange(0.0, 1.0)
+        self.speed_ki_spin.setDecimals(6)
+        self.speed_ki_spin.setSingleStep(0.001)
+        self.speed_ki_spin.setValue(0.005)
+        self.speed_ki_spin.setToolTip("Speed loop Ki in rad/rad. Use 0.000000 to disable I.")
+        speed_ki_row = QHBoxLayout()
+        self.btn_speed_ki_read = QPushButton("Read Ki")
+        self.btn_speed_ki_apply = QPushButton("Apply Ki")
+        speed_ki_row.addWidget(self.speed_ki_spin)
+        speed_ki_row.addWidget(self.btn_speed_ki_read)
+        speed_ki_row.addWidget(self.btn_speed_ki_apply)
+        speed_form.addRow("speed_ki_rad_per_rad", speed_ki_row)
+
+        self.speed_unwind_gain_spin = QDoubleSpinBox()
+        self.speed_unwind_gain_spin.setRange(0.1, 20.0)
+        self.speed_unwind_gain_spin.setDecimals(3)
+        self.speed_unwind_gain_spin.setSingleStep(0.1)
+        self.speed_unwind_gain_spin.setValue(1.0)
+        self.speed_unwind_gain_spin.setToolTip("Speed loop integral unwind gain.")
+        speed_unwind_row = QHBoxLayout()
+        self.btn_speed_unwind_read = QPushButton("Read Unwind")
+        self.btn_speed_unwind_apply = QPushButton("Apply Unwind")
+        speed_unwind_row.addWidget(self.speed_unwind_gain_spin)
+        speed_unwind_row.addWidget(self.btn_speed_unwind_read)
+        speed_unwind_row.addWidget(self.btn_speed_unwind_apply)
+        speed_form.addRow("speed_unwind_gain", speed_unwind_row)
+        layout.addWidget(speed_box)
+
+        attitude_box = QGroupBox("Attitude Loop")
+        attitude_form = QFormLayout(attitude_box)
+
+        self.attitude_kp_spin = QDoubleSpinBox()
+        self.attitude_kp_spin.setRange(0.0, 1000.0)
+        self.attitude_kp_spin.setDecimals(4)
+        self.attitude_kp_spin.setSingleStep(0.1)
+        self.attitude_kp_spin.setValue(9.6)
+        self.attitude_kp_spin.setToolTip("Attitude loop Kp in A/rad.")
+        attitude_kp_row = QHBoxLayout()
+        self.btn_attitude_kp_read = QPushButton("Read Kp")
+        self.btn_attitude_kp_apply = QPushButton("Apply Kp")
+        attitude_kp_row.addWidget(self.attitude_kp_spin)
+        attitude_kp_row.addWidget(self.btn_attitude_kp_read)
+        attitude_kp_row.addWidget(self.btn_attitude_kp_apply)
+        attitude_form.addRow("attitude_kp_a_per_rad", attitude_kp_row)
+
+        self.attitude_kd_spin = QDoubleSpinBox()
+        self.attitude_kd_spin.setRange(0.0, 1000.0)
+        self.attitude_kd_spin.setDecimals(4)
+        self.attitude_kd_spin.setSingleStep(0.01)
+        self.attitude_kd_spin.setValue(0.18)
+        self.attitude_kd_spin.setToolTip("Attitude loop Kd in A/radps.")
+        attitude_kd_row = QHBoxLayout()
+        self.btn_attitude_kd_read = QPushButton("Read Kd")
+        self.btn_attitude_kd_apply = QPushButton("Apply Kd")
+        attitude_kd_row.addWidget(self.attitude_kd_spin)
+        attitude_kd_row.addWidget(self.btn_attitude_kd_read)
+        attitude_kd_row.addWidget(self.btn_attitude_kd_apply)
+        attitude_form.addRow("attitude_kd_a_per_radps", attitude_kd_row)
+
+        self.attitude_iq_limit_spin = QDoubleSpinBox()
+        self.attitude_iq_limit_spin.setRange(0.001, 1000.0)
+        self.attitude_iq_limit_spin.setDecimals(4)
+        self.attitude_iq_limit_spin.setSingleStep(0.1)
+        self.attitude_iq_limit_spin.setValue(1.6)
+        self.attitude_iq_limit_spin.setToolTip("Attitude loop output limit in A.")
+        attitude_iq_limit_row = QHBoxLayout()
+        self.btn_attitude_iq_limit_read = QPushButton("Read Iq Limit")
+        self.btn_attitude_iq_limit_apply = QPushButton("Apply Iq Limit")
+        attitude_iq_limit_row.addWidget(self.attitude_iq_limit_spin)
+        attitude_iq_limit_row.addWidget(self.btn_attitude_iq_limit_read)
+        attitude_iq_limit_row.addWidget(self.btn_attitude_iq_limit_apply)
+        attitude_form.addRow("attitude_iq_limit_a", attitude_iq_limit_row)
+
+        self.attitude_shutdown_spin = QDoubleSpinBox()
+        self.attitude_shutdown_spin.setRange(0.001, 3.2)
+        self.attitude_shutdown_spin.setDecimals(4)
+        self.attitude_shutdown_spin.setSingleStep(0.01)
+        self.attitude_shutdown_spin.setValue(2.0)
+        self.attitude_shutdown_spin.setToolTip("Attitude shutdown threshold in rad.")
+        attitude_shutdown_row = QHBoxLayout()
+        self.btn_attitude_shutdown_read = QPushButton("Read Shutdown")
+        self.btn_attitude_shutdown_apply = QPushButton("Apply Shutdown")
+        attitude_shutdown_row.addWidget(self.attitude_shutdown_spin)
+        attitude_shutdown_row.addWidget(self.btn_attitude_shutdown_read)
+        attitude_shutdown_row.addWidget(self.btn_attitude_shutdown_apply)
+        attitude_form.addRow("attitude_shutdown_rad", attitude_shutdown_row)
+
+        layout.addWidget(attitude_box)
 
         btn_row = QHBoxLayout()
         self.btn_ping = QPushButton("Ping")
@@ -339,6 +522,7 @@ class MainWindow(QMainWindow):
         self.control_state.mock_mode = mock_mode
         self.ctrl_port.setText(port)
         self.ctrl_baud.setText(str(baud))
+        self._refresh_serial_ports(preferred=port)
         self.ctrl_rate_spin.setValue(rate_hz)
         self.ctrl_mock_checkbox.setChecked(mock_mode)
         self.live_rate.setText(str(rate_hz))
@@ -364,19 +548,34 @@ class MainWindow(QMainWindow):
         self.btn_disconnect.clicked.connect(self._on_disconnect_clicked)
         self.btn_stream_start.clicked.connect(self._on_start_stream_clicked)
         self.btn_stream_stop.clicked.connect(self._on_stop_stream_clicked)
+        self.btn_stream_record.clicked.connect(self._on_stream_record_clicked)
 
         self.btn_ping.clicked.connect(self._on_ping_clicked)
-        self.btn_driver_on.clicked.connect(
-            lambda: self._append_control_log("Driver On action reserved")
+        self.btn_driver_on.clicked.connect(lambda: self._on_driver_clicked(True))
+        self.btn_driver_off.clicked.connect(lambda: self._on_driver_clicked(False))
+        self.btn_balance_on.clicked.connect(lambda: self._on_balance_clicked(True))
+        self.btn_balance_off.clicked.connect(lambda: self._on_balance_clicked(False))
+        self.btn_speed_kp_read.clicked.connect(self._on_speed_kp_read_clicked)
+        self.btn_speed_kp_apply.clicked.connect(self._on_speed_kp_apply_clicked)
+        self.btn_speed_ki_read.clicked.connect(self._on_speed_ki_read_clicked)
+        self.btn_speed_ki_apply.clicked.connect(self._on_speed_ki_apply_clicked)
+        self.btn_speed_unwind_read.clicked.connect(self._on_speed_unwind_read_clicked)
+        self.btn_speed_unwind_apply.clicked.connect(self._on_speed_unwind_apply_clicked)
+        self.btn_attitude_kp_read.clicked.connect(self._on_attitude_kp_read_clicked)
+        self.btn_attitude_kp_apply.clicked.connect(self._on_attitude_kp_apply_clicked)
+        self.btn_attitude_kd_read.clicked.connect(self._on_attitude_kd_read_clicked)
+        self.btn_attitude_kd_apply.clicked.connect(self._on_attitude_kd_apply_clicked)
+        self.btn_attitude_iq_limit_read.clicked.connect(
+            self._on_attitude_iq_limit_read_clicked
         )
-        self.btn_driver_off.clicked.connect(
-            lambda: self._append_control_log("Driver Off action reserved")
+        self.btn_attitude_iq_limit_apply.clicked.connect(
+            self._on_attitude_iq_limit_apply_clicked
         )
-        self.btn_balance_on.clicked.connect(
-            lambda: self._append_control_log("Balance On action reserved")
+        self.btn_attitude_shutdown_read.clicked.connect(
+            self._on_attitude_shutdown_read_clicked
         )
-        self.btn_balance_off.clicked.connect(
-            lambda: self._append_control_log("Balance Off action reserved")
+        self.btn_attitude_shutdown_apply.clicked.connect(
+            self._on_attitude_shutdown_apply_clicked
         )
         self.btn_fastring_status.clicked.connect(self._on_fastring_status_clicked)
         self.btn_fastring_dump_left.clicked.connect(
@@ -387,13 +586,64 @@ class MainWindow(QMainWindow):
         )
         self.btn_fastring_dump_both.clicked.connect(self._start_fastring_split_dump)
         self.btn_fastring_dump.clicked.connect(self._on_fastring_dump_clicked)
+        self.btn_refresh_ports.clicked.connect(self._on_refresh_ports_clicked)
+        self.ctrl_port_combo.currentTextChanged.connect(self._on_port_combo_changed)
+
+    def _on_refresh_ports_clicked(self) -> None:
+        preferred = self.ctrl_port_combo.currentText().strip() or self.control_state.port or "COM33"
+        self._refresh_serial_ports(preferred=preferred)
+
+    def _on_port_combo_changed(self, text: str) -> None:
+        port = text.strip()
+        if port:
+            self.control_state.port = port
+            self.ctrl_port.setText(port)
+
+    def _refresh_serial_ports(self, preferred: str | None = None) -> None:
+        preferred_port = (preferred or "").strip()
+        existing_text = self.ctrl_port_combo.currentText().strip()
+        if not preferred_port:
+            preferred_port = existing_text or self.control_state.port or "COM33"
+
+        ports: list[str] = []
+        try:
+            from serial.tools import list_ports
+
+            ports = sorted([p.device for p in list_ports.comports()])
+        except Exception as e:
+            self._append_control_log(f"[WARN] list serial ports failed: {e}")
+
+        current = preferred_port
+        self.ctrl_port_combo.blockSignals(True)
+        self.ctrl_port_combo.clear()
+        if ports:
+            self.ctrl_port_combo.addItems(ports)
+        else:
+            self.ctrl_port_combo.addItem(preferred_port or "COM33")
+
+        if preferred_port and self.ctrl_port_combo.findText(preferred_port) < 0:
+            self.ctrl_port_combo.addItem(preferred_port)
+
+        if preferred_port:
+            self.ctrl_port_combo.setCurrentText(preferred_port)
+        elif self.ctrl_port_combo.count() > 0:
+            current = self.ctrl_port_combo.itemText(0)
+            self.ctrl_port_combo.setCurrentIndex(0)
+        self.ctrl_port_combo.blockSignals(False)
+
+        chosen = self.ctrl_port_combo.currentText().strip() or current
+        if chosen:
+            self.control_state.port = chosen
+            self.ctrl_port.setText(chosen)
 
     def _on_connect_clicked(self) -> None:
         if self._transport is not None or self.control_state.connecting:
             self._append_control_log("[WARN] connect already in progress or active")
             return
 
-        port = self.control_state.port or "COM33"
+        port = self.ctrl_port_combo.currentText().strip() or self.control_state.port or "COM33"
+        self.control_state.port = port
+        self.ctrl_port.setText(port)
         baud = self.control_state.baud or 921600
 
         self.control_state.connecting = True
@@ -465,6 +715,13 @@ class MainWindow(QMainWindow):
         else:
             self._append_control_log("[WARN] get_info failed")
 
+        self._on_speed_kp_read_clicked()
+        self._on_speed_ki_read_clicked()
+        self._on_speed_unwind_read_clicked()
+        self._on_attitude_kp_read_clicked()
+        self._on_attitude_kd_read_clicked()
+        self._on_attitude_iq_limit_read_clicked()
+        self._on_attitude_shutdown_read_clicked()
         self._apply_ui_state()
 
     def _on_connect_failed(self, message: str) -> None:
@@ -476,6 +733,8 @@ class MainWindow(QMainWindow):
 
     def _on_disconnect_clicked(self) -> None:
         self._append_control_log("Disconnecting...")
+        if self.live_state.recording:
+            self._finish_stream_recording("disconnected")
         self._stop_stream_internal()
 
         if self._transport is not None:
@@ -518,8 +777,76 @@ class MainWindow(QMainWindow):
 
     def _on_stop_stream_clicked(self) -> None:
         self._append_control_log("Stopping stream...")
+        if self.live_state.recording:
+            self._finish_stream_recording("stopped manually")
         self._stop_stream_internal()
         self._append_control_log("Stream stopped.")
+
+    def _on_stream_record_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+        if self.live_state.recording:
+            self._append_control_log("[WARN] stream recording already in progress")
+            return
+
+        duration_s = float(self.record_duration_spin.value())
+        self.live_state.record_duration_s = duration_s
+
+        auto_started = False
+        if not self.control_state.streaming:
+            self._append_control_log("Record requested: stream is stopped, starting stream first...")
+            self._on_start_stream_clicked()
+            if not self.control_state.streaming:
+                self._append_control_log("[ERROR] cannot start recording because stream failed to start")
+                return
+            auto_started = True
+
+        self.live_state.record_rows = []
+        self.live_state.recording = True
+        self.live_state.record_auto_started_stream = auto_started
+        self.live_state.record_deadline_monotonic = time.monotonic() + duration_s
+        self._append_control_log(f"Stream recording started ({duration_s:.1f}s)")
+        self._apply_ui_state()
+
+    def _finish_stream_recording(self, reason: str | None = None) -> None:
+        if not self.live_state.recording:
+            return
+
+        rows = list(self.live_state.record_rows)
+        auto_started = self.live_state.record_auto_started_stream
+        self.live_state.recording = False
+        self.live_state.record_rows = []
+        self.live_state.record_auto_started_stream = False
+        self.live_state.record_deadline_monotonic = 0.0
+
+        output_path = None
+        if len(rows) > 0:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            output_path = self._resolve_stream_output_path(f"stream_{timestamp}.csv")
+            self.live_state.record_output_path = str(output_path)
+            try:
+                self._write_stream_csv(rows, output_path)
+                self._append_control_log(
+                    f"Stream recording saved: {len(rows)} frames -> {output_path}"
+                )
+            except OSError as e:
+                self._append_control_log(
+                    f"[ERROR] cannot write stream CSV: {output_path} ({e})"
+                )
+        else:
+            self._append_control_log("[WARN] stream recording finished with 0 frames")
+
+        if reason is not None:
+            self._append_control_log(f"Stream recording ended ({reason})")
+        elif output_path is not None:
+            self._append_control_log("Stream recording ended (duration reached)")
+
+        if auto_started and self.control_state.streaming:
+            self._append_control_log("Auto-stopping stream (recording started it)")
+            self._stop_stream_internal()
+
+        self._apply_ui_state()
 
     def _stop_stream_internal(self) -> None:
         if not self.control_state.streaming:
@@ -540,6 +867,227 @@ class MainWindow(QMainWindow):
             return
         ok = self._transport.ping()
         self._append_control_log(f"Ping -> {'OK' if ok else 'FAIL'}")
+
+    def _on_driver_clicked(self, enable: bool) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+        action = "ON" if enable else "OFF"
+        self._append_control_log(f"Driver {action}...")
+        ok = self._transport.driver_enable(enable)
+        self._append_control_log(f"Driver {action} -> {'OK' if ok else 'FAIL'}")
+
+    def _on_balance_clicked(self, enable: bool) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+        action = "ON" if enable else "OFF"
+        self._append_control_log(f"Balance {action}...")
+        ok = self._transport.balance_enable(enable)
+        self._append_control_log(f"Balance {action} -> {'OK' if ok else 'FAIL'}")
+
+    def _on_speed_kp_read_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+        try:
+            value = self._transport.get_speed_kp()
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] read Speed Kp failed: {e}")
+            return
+
+        self.speed_kp_spin.setValue(value)
+        self._append_control_log(f"Speed Kp <- {value:.6f}")
+
+    def _on_speed_kp_apply_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+
+        value = float(self.speed_kp_spin.value())
+        try:
+            ok = self._transport.set_speed_kp(value)
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] apply Speed Kp failed: {e}")
+            return
+
+        self._append_control_log(
+            f"Speed Kp -> {value:.6f} {'OK' if ok else 'FAIL'}"
+        )
+
+    def _on_speed_ki_read_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+        try:
+            value = self._transport.get_speed_ki()
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] read Speed Ki failed: {e}")
+            return
+
+        self.speed_ki_spin.setValue(value)
+        self._append_control_log(f"Speed Ki <- {value:.6f}")
+
+    def _on_speed_ki_apply_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+
+        value = float(self.speed_ki_spin.value())
+        try:
+            ok = self._transport.set_speed_ki(value)
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] apply Speed Ki failed: {e}")
+            return
+
+        self._append_control_log(
+            f"Speed Ki -> {value:.6f} {'OK' if ok else 'FAIL'}"
+        )
+
+    def _on_speed_unwind_read_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+        try:
+            value = self._transport.get_speed_unwind_gain()
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] read Speed Unwind failed: {e}")
+            return
+
+        self.speed_unwind_gain_spin.setValue(value)
+        self._append_control_log(f"Speed Unwind <- {value:.3f}")
+
+    def _on_speed_unwind_apply_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+
+        value = float(self.speed_unwind_gain_spin.value())
+        try:
+            ok = self._transport.set_speed_unwind_gain(value)
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] apply Speed Unwind failed: {e}")
+            return
+
+        self._append_control_log(
+            f"Speed Unwind -> {value:.3f} {'OK' if ok else 'FAIL'}"
+        )
+
+    def _on_attitude_kp_read_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+        try:
+            value = self._transport.get_attitude_kp()
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] read Attitude Kp failed: {e}")
+            return
+
+        self.attitude_kp_spin.setValue(value)
+        self._append_control_log(f"Attitude Kp <- {value:.4f}")
+
+    def _on_attitude_kp_apply_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+
+        value = float(self.attitude_kp_spin.value())
+        try:
+            ok = self._transport.set_attitude_kp(value)
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] apply Attitude Kp failed: {e}")
+            return
+
+        self._append_control_log(
+            f"Attitude Kp -> {value:.4f} {'OK' if ok else 'FAIL'}"
+        )
+
+    def _on_attitude_kd_read_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+        try:
+            value = self._transport.get_attitude_kd()
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] read Attitude Kd failed: {e}")
+            return
+
+        self.attitude_kd_spin.setValue(value)
+        self._append_control_log(f"Attitude Kd <- {value:.4f}")
+
+    def _on_attitude_kd_apply_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+
+        value = float(self.attitude_kd_spin.value())
+        try:
+            ok = self._transport.set_attitude_kd(value)
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] apply Attitude Kd failed: {e}")
+            return
+
+        self._append_control_log(
+            f"Attitude Kd -> {value:.4f} {'OK' if ok else 'FAIL'}"
+        )
+
+    def _on_attitude_iq_limit_read_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+        try:
+            value = self._transport.get_attitude_iq_limit()
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] read Attitude Iq Limit failed: {e}")
+            return
+
+        self.attitude_iq_limit_spin.setValue(value)
+        self._append_control_log(f"Attitude Iq Limit <- {value:.4f}")
+
+    def _on_attitude_iq_limit_apply_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+
+        value = float(self.attitude_iq_limit_spin.value())
+        try:
+            ok = self._transport.set_attitude_iq_limit(value)
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] apply Attitude Iq Limit failed: {e}")
+            return
+
+        self._append_control_log(
+            f"Attitude Iq Limit -> {value:.4f} {'OK' if ok else 'FAIL'}"
+        )
+
+    def _on_attitude_shutdown_read_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+        try:
+            value = self._transport.get_attitude_shutdown_rad()
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] read Attitude Shutdown failed: {e}")
+            return
+
+        self.attitude_shutdown_spin.setValue(value)
+        self._append_control_log(f"Attitude Shutdown <- {value:.4f} rad")
+
+    def _on_attitude_shutdown_apply_clicked(self) -> None:
+        if self._transport is None:
+            self._append_control_log("[WARN] not connected")
+            return
+
+        value = float(self.attitude_shutdown_spin.value())
+        try:
+            ok = self._transport.set_attitude_shutdown_rad(value)
+        except TransportError as e:
+            self._append_control_log(f"[ERROR] apply Attitude Shutdown failed: {e}")
+            return
+
+        self._append_control_log(
+            f"Attitude Shutdown -> {value:.4f} rad {'OK' if ok else 'FAIL'}"
+        )
 
     def _on_stream_frame(self, frame: LiveFrame) -> None:
         self.gateway.liveFrameReady.emit(frame)
@@ -840,6 +1388,72 @@ class MainWindow(QMainWindow):
         output_dir.mkdir(parents=True, exist_ok=True)
         return output_dir / filename
 
+    def _resolve_stream_output_path(self, filename: str) -> Path:
+        output_dir = self._repo_root / "stream_data"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir / filename
+
+    def _write_stream_csv(self, rows: list[LiveFrame], output_path: Path) -> None:
+        with open(output_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "idx",
+                    "host_rx_time_ms",
+                    "tick_ms",
+                    "pitch_target_deg",
+                    "speed_p_term_deg",
+                    "speed_i_term_deg",
+                    "pitch_meas_deg",
+                    "pitch_rate_dps",
+                    "speed_target_radps",
+                    "speed_meas_radps",
+                    "speed_raw_radps",
+                    "attitude_p_iq_cmd_a",
+                    "attitude_d_iq_cmd_a",
+                    "iq_cmd_a",
+                    "iq_cmd_clamped_a",
+                    "speed_output_limit_deg",
+                    "attitude_output_limit_a",
+                    "iq_l_a",
+                    "iq_r_a",
+                    "uq_l_v",
+                    "uq_r_v",
+                    "bus_v",
+                    "fault_flags",
+                    "fault_labels",
+                ]
+            )
+            for idx, frame in enumerate(rows):
+                writer.writerow(
+                    [
+                        idx,
+                        frame.host_rx_time_ms,
+                        frame.tick_ms,
+                        frame.pitch_target_deg,
+                        frame.speed_p_term_deg,
+                        frame.speed_i_term_deg,
+                        frame.pitch_meas_deg,
+                        frame.pitch_rate_dps,
+                        frame.speed_target_radps,
+                        frame.speed_meas_radps,
+                        frame.speed_raw_radps,
+                        frame.attitude_p_iq_cmd_a,
+                        frame.attitude_d_iq_cmd_a,
+                        frame.iq_cmd_a,
+                        frame.iq_cmd_clamped_a,
+                        frame.speed_output_limit_deg,
+                        frame.attitude_output_limit_a,
+                        frame.iq_l_a,
+                        frame.iq_r_a,
+                        frame.uq_l_v,
+                        frame.uq_r_v,
+                        frame.bus_v,
+                        frame.fault_flags,
+                        frame.fault_labels,
+                    ]
+                )
+
     def _toggle_live_pause(self) -> None:
         self.live_state.paused = not self.live_state.paused
         self.btn_pause_view.setText("Resume View" if self.live_state.paused else "Pause View")
@@ -862,24 +1476,62 @@ class MainWindow(QMainWindow):
         self.live_mode.setText("mock" if self.control_state.mock_mode else "real")
         self.live_stream.setText("running" if streaming else "stopped")
         self.live_rate.setText(str(self.ctrl_rate_spin.value()))
+        if self.live_state.recording:
+            remain = max(0.0, self.live_state.record_deadline_monotonic - time.monotonic())
+            self.live_record.setText(
+                f"recording ({remain:.1f}s, n={len(self.live_state.record_rows)})"
+            )
+            self.btn_stream_record.setText("Recording...")
+        else:
+            self.live_record.setText("idle")
+            self.btn_stream_record.setText("Record Stream CSV")
 
         self.btn_connect.setEnabled(not connected and not connecting)
         self.btn_disconnect.setEnabled(connected and not busy)
         self.btn_stream_start.setEnabled(connected and not streaming and not busy)
         self.btn_stream_stop.setEnabled(connected and streaming and not busy)
         self.btn_pause_view.setEnabled(connected or self.control_state.mock_mode)
+        self.record_duration_spin.setEnabled(
+            connected and (not self.live_state.recording) and (not busy)
+        )
+        self.btn_stream_record.setEnabled(
+            connected and (not self.live_state.recording) and (not busy)
+        )
 
         self.btn_ping.setEnabled(connected and not busy)
         self.btn_driver_on.setEnabled(connected and not busy)
         self.btn_driver_off.setEnabled(connected and not busy)
         self.btn_balance_on.setEnabled(connected and not busy)
         self.btn_balance_off.setEnabled(connected and not busy)
+        self.speed_kp_spin.setEnabled(connected and not busy)
+        self.btn_speed_kp_read.setEnabled(connected and not busy)
+        self.btn_speed_kp_apply.setEnabled(connected and not busy)
+        self.speed_ki_spin.setEnabled(connected and not busy)
+        self.btn_speed_ki_read.setEnabled(connected and not busy)
+        self.btn_speed_ki_apply.setEnabled(connected and not busy)
+        self.speed_unwind_gain_spin.setEnabled(connected and not busy)
+        self.btn_speed_unwind_read.setEnabled(connected and not busy)
+        self.btn_speed_unwind_apply.setEnabled(connected and not busy)
+        self.attitude_kp_spin.setEnabled(connected and not busy)
+        self.btn_attitude_kp_read.setEnabled(connected and not busy)
+        self.btn_attitude_kp_apply.setEnabled(connected and not busy)
+        self.attitude_kd_spin.setEnabled(connected and not busy)
+        self.btn_attitude_kd_read.setEnabled(connected and not busy)
+        self.btn_attitude_kd_apply.setEnabled(connected and not busy)
+        self.attitude_iq_limit_spin.setEnabled(connected and not busy)
+        self.btn_attitude_iq_limit_read.setEnabled(connected and not busy)
+        self.btn_attitude_iq_limit_apply.setEnabled(connected and not busy)
+        self.attitude_shutdown_spin.setEnabled(connected and not busy)
+        self.btn_attitude_shutdown_read.setEnabled(connected and not busy)
+        self.btn_attitude_shutdown_apply.setEnabled(connected and not busy)
 
         self.btn_fastring_status.setEnabled(connected and not streaming and not busy)
         self.btn_fastring_dump_left.setEnabled(connected and not streaming and not busy)
         self.btn_fastring_dump_right.setEnabled(connected and not streaming and not busy)
         self.btn_fastring_dump_both.setEnabled(connected and not streaming and not busy)
         self.btn_fastring_dump.setEnabled(connected and not streaming and not busy)
+        self.ctrl_port_combo.setEnabled(not connected and not busy)
+        self.btn_refresh_ports.setEnabled(not connected and not busy)
         self.ctrl_rate_spin.setEnabled(not connected and not busy)
         self.ctrl_mock_checkbox.setEnabled(False)
 
@@ -890,6 +1542,10 @@ class MainWindow(QMainWindow):
         self.ctrl_port.setText(port or "-")
         self.ctrl_baud.setText(str(baud) if baud is not None else "-")
         if not connected:
+            self._refresh_serial_ports(preferred=port or self.control_state.port or "COM33")
+        if not connected:
+            if self.live_state.recording:
+                self._finish_stream_recording("link lost")
             self.control_state.streaming = False
             self.live_state.last_frame = None
             self._reset_live_view()
@@ -905,6 +1561,13 @@ class MainWindow(QMainWindow):
         self._apply_ui_state()
 
     def _on_live_frame(self, frame: LiveFrame) -> None:
+        if self.live_state.recording:
+            self.live_state.record_rows.append(frame)
+            if time.monotonic() >= self.live_state.record_deadline_monotonic:
+                self._finish_stream_recording()
+            else:
+                self._apply_ui_state()
+
         if self.live_state.paused:
             return
         self.live_state.last_frame = frame
@@ -947,6 +1610,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:
         self._closing = True
+        if self.live_state.recording:
+            self._finish_stream_recording("window closed")
         self._stop_stream_internal()
         if self._transport is not None:
             try:
@@ -988,6 +1653,7 @@ class MockFeeder(QObject):
             pitch_rate_dps=2.5 * math.cos(self.phase),
             speed_target_radps=0.0,
             speed_meas_radps=0.4 * math.sin(self.phase * 0.6),
+            speed_raw_radps=-0.4 * math.sin(self.phase * 0.6),
             attitude_p_iq_cmd_a=0.2 * math.sin(self.phase * 1.3),
             attitude_d_iq_cmd_a=0.1 * math.cos(self.phase * 1.4),
             iq_cmd_a=0.25 * math.sin(self.phase * 1.2),

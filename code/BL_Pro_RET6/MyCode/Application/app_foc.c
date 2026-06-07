@@ -29,11 +29,20 @@ static uint8_t App_InitMotor1Stack(void);
 static uint8_t App_InitMotor2Stack(void);
 static uint8_t App_InitFOCAlgorithm(void);
 static void App_FOC_ForcePowerStageOff(void);
+static int16_t app_fastlog_scale_to_i16(float value, float scale);
 
 static volatile uint8_t g_foc_stack_ready = 0U;
 static volatile uint8_t g_bus_telemetry_ready = 0U;
 static volatile uint8_t g_foc_power_stage_enabled = 0U;
 static uint32_t         g_last_bus_voltage_sample_tick_ms = 0U;
+
+/* FOC timing state shared by the SimpleFOC compatibility layer. */
+FocFrequency_t g_foc = {
+    .g_foc_frequency = FOC_FREQUENCY_DEFAULT,
+    .g_foc_period_s = FOC_PERIOD_S_DEFAULT,
+    .g_foc_period_us = FOC_PERIOD_US_DEFAULT,
+    .g_foc_it_timer = &htim5,
+};
 
 
 
@@ -71,6 +80,7 @@ uint8_t App_FOCStack_Init(void)
         USB_Debug_Printf("FOC algorithm init failed\r\n");
         return 0U;
     }
+    App_FOC_ForcePowerStageOff();
     App_ResetFastRing();
     g_foc_stack_ready = 1U;
     g_last_bus_voltage_sample_tick_ms = HAL_GetTick();
@@ -151,6 +161,10 @@ static uint8_t App_BusVoltageStartupSample(void);
 #define APP_BUS_VOLTAGE_VALID_MIN_V (5.0f)
 #define APP_BUS_VOLTAGE_VALID_MAX_V (30.0f)
 
+
+
+
+
 static void App_ServiceBusVoltageSample(void)
 {
 #if APP_BUS_VOLTAGE_ENABLE
@@ -196,6 +210,8 @@ static void App_ServiceBusVoltageSample(void)
 PID_t Left_Velocity_FOC_PID;
 static float g_speed_target_radps = 0.3f;
 volatile uint8_t g_current_pid_mode = 0U; /* 0=CurrentLoop_FFPI_V1, 1=Pure PI compare */
+static volatile float g_current_i_sep_ratio_ff = CURRENT_LOOP_I_SEP_RATIO;
+static volatile float g_current_i_sep_ratio_pure = CURRENT_LOOP_PURE_PI_I_SEP_RATIO;
 
 float g_speed_fault2 = 0.0f;
 float g_speed_fault1 = 0.0f;
@@ -269,167 +285,6 @@ extern float vel_windowed_f2;
 #error "APP_MOVE_DOWNSAMPLE must be >= 1"
 #endif
 
-#define APP_MATRIX_ENABLE          (0U)
-#define APP_MATRIX_LEVEL_COUNT     (3U)
-#define APP_MATRIX_RUNS_PER_LEVEL  (3U)
-#define APP_MATRIX_SETTLE_MS       (1000U)
-#define APP_MATRIX_MEASURE_MS      (4000U)
-
-typedef struct {
-    float avg_abs_vel;
-    float max_abs_vel;
-    float avg_vel;
-    uint32_t sample_count;
-} AppMatrixResult_t;
-
-static const float g_matrix_uq_levels[APP_MATRIX_LEVEL_COUNT] = {0.5f, 1.0f, 1.5f};
-static AppMatrixResult_t g_matrix_results[APP_MATRIX_LEVEL_COUNT][APP_MATRIX_RUNS_PER_LEVEL];
-static uint8_t g_matrix_started = 0U;
-static uint8_t g_matrix_finished = 0U;
-static uint8_t g_matrix_level_idx = 0U;
-static uint8_t g_matrix_run_idx = 0U;
-static uint8_t g_matrix_phase = 0U; /* 0:settle, 1:measure */
-static uint32_t g_matrix_phase_start_ms = 0U;
-static float g_matrix_sum_abs_vel = 0.0f;
-static float g_matrix_max_abs_vel = 0.0f;
-static float g_matrix_sum_vel = 0.0f;
-static uint32_t g_matrix_samples = 0U;
-
-static void App_MatrixResetStats(void)
-{
-    g_matrix_sum_abs_vel = 0.0f;
-    g_matrix_max_abs_vel = 0.0f;
-    g_matrix_sum_vel = 0.0f;
-    g_matrix_samples = 0U;
-}
-
-static void App_MatrixPrintFinalSummary(void)
-{
-    uint8_t lv = 0U;
-
-    USB_Debug_Printf("[MATRIX] all runs finished\r\n");
-    for (lv = 0U; lv < APP_MATRIX_LEVEL_COUNT; lv++) {
-        float level_sum_avg_abs = 0.0f;
-        float level_max_abs = 0.0f;
-        float level_sum_avg_vel = 0.0f;
-        uint8_t rn = 0U;
-
-        for (rn = 0U; rn < APP_MATRIX_RUNS_PER_LEVEL; rn++) {
-            AppMatrixResult_t *r = &g_matrix_results[lv][rn];
-            level_sum_avg_abs += r->avg_abs_vel;
-            level_sum_avg_vel += r->avg_vel;
-            if (r->max_abs_vel > level_max_abs) {
-                level_max_abs = r->max_abs_vel;
-            }
-        }
-
-        USB_Debug_Printf("[MATRIX][L%u uq=%.2f] mean|vel|=%.3f peak|vel|=%.3f meanVel=%.3f\r\n",
-                         (unsigned)(lv + 1U),
-                         g_matrix_uq_levels[lv],
-                         level_sum_avg_abs / (float)APP_MATRIX_RUNS_PER_LEVEL,
-                         level_max_abs,
-                         level_sum_avg_vel / (float)APP_MATRIX_RUNS_PER_LEVEL);
-    }
-}
-
-static __attribute__((unused)) float App_MatrixStep(uint32_t now_ms, float vel)
-{
-    float uq = APP_LOOP_TEST_UQ_V;
-
-    if (g_matrix_finished) {
-        return 0.0f;
-    }
-
-    if (!g_matrix_started) {
-        g_matrix_started = 1U;
-        g_matrix_phase = 0U;
-        g_matrix_phase_start_ms = now_ms;
-        App_MatrixResetStats();
-        USB_Debug_Printf("[MATRIX] start levels=%u runs=%u settle=%ums measure=%ums\r\n",
-                         (unsigned)APP_MATRIX_LEVEL_COUNT,
-                         (unsigned)APP_MATRIX_RUNS_PER_LEVEL,
-                         (unsigned)APP_MATRIX_SETTLE_MS,
-                         (unsigned)APP_MATRIX_MEASURE_MS);
-    }
-
-    uq = g_matrix_uq_levels[g_matrix_level_idx];
-
-    if (g_matrix_phase == 0U) {
-        if ((now_ms - g_matrix_phase_start_ms) >= APP_MATRIX_SETTLE_MS) {
-            g_matrix_phase = 1U;
-            g_matrix_phase_start_ms = now_ms;
-            App_MatrixResetStats();
-            USB_Debug_Printf("[MATRIX] measure begin level=%u run=%u uq=%.2f\r\n",
-                             (unsigned)(g_matrix_level_idx + 1U),
-                             (unsigned)(g_matrix_run_idx + 1U),
-                             uq);
-        }
-        return uq;
-    }
-
-    if (g_matrix_phase == 1U) {
-        float abs_vel = fabsf(vel);
-        g_matrix_sum_abs_vel += abs_vel;
-        g_matrix_sum_vel += vel;
-        if (abs_vel > g_matrix_max_abs_vel) {
-            g_matrix_max_abs_vel = abs_vel;
-        }
-        g_matrix_samples++;
-
-        if ((now_ms - g_matrix_phase_start_ms) >= APP_MATRIX_MEASURE_MS) {
-            AppMatrixResult_t *r = &g_matrix_results[g_matrix_level_idx][g_matrix_run_idx];
-            const char *dir = ".";
-
-            r->sample_count = g_matrix_samples;
-            if (g_matrix_samples > 0U) {
-                r->avg_abs_vel = g_matrix_sum_abs_vel / (float)g_matrix_samples;
-                r->avg_vel = g_matrix_sum_vel / (float)g_matrix_samples;
-                r->max_abs_vel = g_matrix_max_abs_vel;
-            } else {
-                r->avg_abs_vel = 0.0f;
-                r->avg_vel = 0.0f;
-                r->max_abs_vel = 0.0f;
-            }
-
-            if (r->avg_vel > 0.05f) {
-                dir = "+";
-            } else if (r->avg_vel < -0.05f) {
-                dir = "-";
-            }
-
-            USB_Debug_Printf("[MATRIX][L%u R%u uq=%.2f] avg|vel|=%.3f max|vel|=%.3f avgVel=%.3f dir=%s n=%lu\r\n",
-                             (unsigned)(g_matrix_level_idx + 1U),
-                             (unsigned)(g_matrix_run_idx + 1U),
-                             uq,
-                             r->avg_abs_vel,
-                             r->max_abs_vel,
-                             r->avg_vel,
-                             dir,
-                             (unsigned long)r->sample_count);
-
-            g_matrix_run_idx++;
-            if (g_matrix_run_idx >= APP_MATRIX_RUNS_PER_LEVEL) {
-                g_matrix_run_idx = 0U;
-                g_matrix_level_idx++;
-            }
-
-            if (g_matrix_level_idx >= APP_MATRIX_LEVEL_COUNT) {
-                g_matrix_finished = 1U;
-                App_MatrixPrintFinalSummary();
-                return 0.0f;
-            }
-
-            g_matrix_phase = 0U;
-            g_matrix_phase_start_ms = now_ms;
-            App_MatrixResetStats();
-        }
-    }
-
-    return uq;
-}
-
-
-
 /* 重置 PID 运行状态：只清积分、上次误差和输出，不改 PID 参数 */
 static void App_PIDResetRuntime(PID_t *pid)
 {
@@ -456,6 +311,8 @@ static void App_CurrentLoopDebugClear(volatile CurrentLoopDebugSnapshot_t *debug
     debug->integral_limit = 0.0f;
     debug->pid_integral = 0.0f;
 }
+
+
 
 
 /* 对外部 target_iq 做斜率限制，生成电流环内部目标 iq_ref。
@@ -545,9 +402,9 @@ static float App_CurrentLoopComputeUq(Motor_t *motor,
 
     /* 前馈 PI 和纯 PI 使用不同积分分离阈值 */
     if (use_feedforward) {
-        pid->I_SEP_RATIO = CURRENT_LOOP_I_SEP_RATIO;
+        pid->I_SEP_RATIO = g_current_i_sep_ratio_ff;
     } else {
-        pid->I_SEP_RATIO = CURRENT_LOOP_PURE_PI_I_SEP_RATIO;
+        pid->I_SEP_RATIO = g_current_i_sep_ratio_pure;
     }
 
     /* 目标电流幅值下降时，短时间启用积分卸载限速 */
@@ -649,6 +506,7 @@ static void App_PrintCurrentLoopDebugIfDue(void)
 }
 
 
+
 /* 应用一组电流环 PID 参数，并保留原有输出限幅/积分分离下限等配置 */
 static void App_CurrentPIDApplyOne(PID_t *pid, float kp, float ki, float kd, float integral_limit)
 {
@@ -662,11 +520,45 @@ static void App_CurrentPIDApplyOne(PID_t *pid, float kp, float ki, float kd, flo
 
     output_limit = (pid->output_limit > 0.0f) ? pid->output_limit : APP_CURRENT_OUT_LIMIT;
     i_err_min = (pid->I_ERR_MIN > 0.0f) ? pid->I_ERR_MIN : APP_CURRENT_I_ERR_MIN;
-    i_sep_ratio = (pid->I_SEP_RATIO > 0.0f) ? pid->I_SEP_RATIO : CURRENT_LOOP_I_SEP_RATIO;
+    i_sep_ratio = (pid->I_SEP_RATIO > 0.0f) ? pid->I_SEP_RATIO : g_current_i_sep_ratio_ff;
 
     PID_ParameterInitEx(pid, kp, ki, kd, integral_limit,
                         output_limit, i_err_min, i_sep_ratio);
 
+    App_PIDResetRuntime(pid);
+}
+
+static void App_CurrentPIDSelectPairByMode(uint8_t mode, PID_t **pid1, PID_t **pid2)
+{
+    if ((pid1 == NULL) || (pid2 == NULL)) {
+        return;
+    }
+
+    if (mode == 0U) {
+        *pid1 = &g_current_pid1;
+        *pid2 = &g_current_pid2;
+    } else {
+        *pid1 = &g_current_pid1_Common;
+        *pid2 = &g_current_pid2_Common;
+    }
+}
+
+static void App_CurrentPIDReinitOneWithExisting(PID_t *pid,
+                                                float output_limit,
+                                                float i_err_min,
+                                                float i_sep_ratio)
+{
+    if (pid == NULL) {
+        return;
+    }
+    PID_ParameterInitEx(pid,
+                        pid->Kp,
+                        pid->Ki,
+                        pid->Kd,
+                        pid->integral_limit,
+                        output_limit,
+                        i_err_min,
+                        i_sep_ratio);
     App_PIDResetRuntime(pid);
 }
 
@@ -683,13 +575,7 @@ void App_CurrentPID_SetSame(float kp, float ki, float kd, float integral_limit)
         integral_limit = APP_CURRENT_I_LIMIT;
     }
 
-    if (g_current_pid_mode == 0U) {
-        pid1 = &g_current_pid1;
-        pid2 = &g_current_pid2;
-    } else {
-        pid1 = &g_current_pid1_Common;
-        pid2 = &g_current_pid2_Common;
-    }
+    App_CurrentPIDSelectPairByMode(g_current_pid_mode, &pid1, &pid2);
 
     __disable_irq();
     App_CurrentPIDApplyOne(pid1, kp, ki, kd, integral_limit);
@@ -742,6 +628,138 @@ void App_CurrentPID_GetSame(float *kp, float *ki, float *kd, float *integral_lim
 /* 重置所有电流环运行状态。
  * 注意：这里也会重置 iq_ref，因此目标电流改变后不会沿用旧斜坡状态。
  */
+uint8_t App_CurrentPID_SetMode(uint8_t mode)
+{
+    if (mode > 1U) {
+        return 0U;
+    }
+    __disable_irq();
+    g_current_pid_mode = mode;
+    __enable_irq();
+    App_ResetCurrentPIDs();
+    return 1U;
+}
+
+uint8_t App_CurrentPID_GetMode(void)
+{
+    return g_current_pid_mode;
+}
+
+uint8_t App_CurrentPID_SetOutputLimit(float output_limit)
+{
+    PID_t *pid1;
+    PID_t *pid2;
+
+    if ((!isfinite(output_limit)) || (output_limit <= 0.0f)) {
+        return 0U;
+    }
+
+    __disable_irq();
+    App_CurrentPIDSelectPairByMode(g_current_pid_mode, &pid1, &pid2);
+    App_CurrentPIDReinitOneWithExisting(pid1, output_limit, pid1->I_ERR_MIN, pid1->I_SEP_RATIO);
+    App_CurrentPIDReinitOneWithExisting(pid2, output_limit, pid2->I_ERR_MIN, pid2->I_SEP_RATIO);
+    __enable_irq();
+    return 1U;
+}
+
+uint8_t App_CurrentPID_GetOutputLimit(float *output_limit)
+{
+    PID_t *pid;
+    float value;
+
+    if (output_limit == NULL) {
+        return 0U;
+    }
+
+    if (g_current_pid_mode == 0U) {
+        pid = &g_current_pid1;
+    } else {
+        pid = &g_current_pid1_Common;
+    }
+
+    __disable_irq();
+    value = pid->output_limit;
+    __enable_irq();
+    *output_limit = value;
+    return 1U;
+}
+
+uint8_t App_CurrentPID_SetIErrMin(float i_err_min)
+{
+    PID_t *pid1;
+    PID_t *pid2;
+
+    if ((!isfinite(i_err_min)) || (i_err_min <= 0.0f)) {
+        return 0U;
+    }
+
+    __disable_irq();
+    App_CurrentPIDSelectPairByMode(g_current_pid_mode, &pid1, &pid2);
+    App_CurrentPIDReinitOneWithExisting(pid1, pid1->output_limit, i_err_min, pid1->I_SEP_RATIO);
+    App_CurrentPIDReinitOneWithExisting(pid2, pid2->output_limit, i_err_min, pid2->I_SEP_RATIO);
+    __enable_irq();
+    return 1U;
+}
+
+uint8_t App_CurrentPID_GetIErrMin(float *i_err_min)
+{
+    PID_t *pid;
+    float value;
+
+    if (i_err_min == NULL) {
+        return 0U;
+    }
+
+    if (g_current_pid_mode == 0U) {
+        pid = &g_current_pid1;
+    } else {
+        pid = &g_current_pid1_Common;
+    }
+
+    __disable_irq();
+    value = pid->I_ERR_MIN;
+    __enable_irq();
+    *i_err_min = value;
+    return 1U;
+}
+
+uint8_t App_CurrentPID_SetISepRatio(float i_sep_ratio)
+{
+    PID_t *pid1;
+    PID_t *pid2;
+
+    if ((!isfinite(i_sep_ratio)) || (i_sep_ratio <= 0.0f) || (i_sep_ratio > 1.0f)) {
+        return 0U;
+    }
+
+    __disable_irq();
+    if (g_current_pid_mode == 0U) {
+        g_current_i_sep_ratio_ff = i_sep_ratio;
+    } else {
+        g_current_i_sep_ratio_pure = i_sep_ratio;
+    }
+    App_CurrentPIDSelectPairByMode(g_current_pid_mode, &pid1, &pid2);
+    App_CurrentPIDReinitOneWithExisting(pid1, pid1->output_limit, pid1->I_ERR_MIN, i_sep_ratio);
+    App_CurrentPIDReinitOneWithExisting(pid2, pid2->output_limit, pid2->I_ERR_MIN, i_sep_ratio);
+    __enable_irq();
+    return 1U;
+}
+
+uint8_t App_CurrentPID_GetISepRatio(float *i_sep_ratio)
+{
+    if (i_sep_ratio == NULL) {
+        return 0U;
+    }
+    __disable_irq();
+    if (g_current_pid_mode == 0U) {
+        *i_sep_ratio = g_current_i_sep_ratio_ff;
+    } else {
+        *i_sep_ratio = g_current_i_sep_ratio_pure;
+    }
+    __enable_irq();
+    return 1U;
+}
+
 void App_ResetCurrentPIDs(void)
 {
     __disable_irq();
@@ -1259,10 +1277,6 @@ void App_Loop(void)
     float vel_target = g_speed_target_radps;
     float vel_error = vel_target - vel;
 
-#if APP_MATRIX_ENABLE
-    uq_cmd = App_MatrixStep(now_ms, vel);
-#endif
-
 #if APP_SPEED_LOOP_ENABLE
     if (fabsf(vel) > APP_SPEED_VEL_FAULT_ABS) {
         g_speed_fault1 = 1U;
@@ -1367,6 +1381,39 @@ uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable)
 uint8_t App_FOC_IsPowerStageEnabled(void)
 {
     return g_foc_power_stage_enabled;
+}
+
+uint8_t App_FOC_SetDriverGateEnabled(uint8_t enable)
+{
+    uint8_t applied = 0U;
+
+    if (enable > 1U) {
+        return 0U;
+    }
+
+#if LEFT_MOTOR_ENABLE
+    if (g_driver1 != NULL) {
+        if (enable != 0U) {
+            Driver_Enable(g_driver1);
+        } else {
+            Driver_Disable(g_driver1);
+        }
+        applied = 1U;
+    }
+#endif
+
+#if RIGHT_MOTOR_ENABLE
+    if (g_driver2 != NULL) {
+        if (enable != 0U) {
+            Driver_Enable(g_driver2);
+        } else {
+            Driver_Disable(g_driver2);
+        }
+        applied = 1U;
+    }
+#endif
+
+    return applied;
 }
 
 float vel1 = 0;
@@ -1497,6 +1544,25 @@ static uint16_t app_fastring_status_flags_snapshot(void)
         flags |= APP_FOC_STATUS_FLAG_ATTITUDE_CONTROL_ON;
     }
     return flags;
+}
+
+static int16_t app_fastlog_scale_to_i16(float value, float scale)
+{
+    float scaled;
+
+    if (scale == 0.0f) {
+        return 0;
+    }
+
+    scaled = value * scale;
+    if (scaled > 32767.0f) {
+        return 32767;
+    }
+    if (scaled < -32768.0f) {
+        return -32768;
+    }
+
+    return (int16_t)scaled;
 }
 
 void App_ResetFastRing(void)
@@ -1950,9 +2016,11 @@ static uint8_t App_InitBusVoltage(void)
 static uint8_t App_InitMotor1Stack(void)
 {
 #if LEFT_MOTOR_ENABLE
+    g_motor1.state.motor_status = motor_initializing;
     /* 左电机 Driver 初始化 */
     g_driver1 = Driver_GetInstance(DRIVER_LEFT);
     if (g_driver1 == NULL) {
+        g_motor1.state.motor_status = motor_init_failed;
         USB_Debug_Printf("Driver_GetInstance1 failed\r\n");
         return 0U;
     }
@@ -1962,10 +2030,15 @@ static uint8_t App_InitMotor1Stack(void)
                      TIM_CHANNEL_1,
                      TIM_CHANNEL_3,
                      TIM_CHANNEL_4,
+                     Motor_EN_GPIO_Port,
+                     Motor_EN_Pin,
+                     1U,
                      19 * 0.577f)) {
+        g_motor1.state.motor_status = motor_init_failed;
         USB_Debug_Printf("Driver1_Init failed\r\n");
         return 0U;
     }
+    Driver_Disable(g_driver1);
 #if APP_BUS_VOLTAGE_FOC_ENABLE
     g_driver1->supply_voltage = g_bus_voltage_filtered;
 #else
@@ -1974,12 +2047,14 @@ static uint8_t App_InitMotor1Stack(void)
 
     /* 左编码器底层驱动 + Sensor 层初始化 */
     if (!AS5047P_RW_Init(&g_enc1, &hspi3, EcdL_CS_GPIO_Port, EcdL_CS_Pin)) {
+        g_motor1.state.motor_status = motor_init_failed;
         USB_Debug_Printf("AS5047P_RW_Init1 failed\r\n");
         return 0U;
     }
 
     Sensor_LinkAS5047P(&g_enc1, &g_sensor1);
     if (!Sensor_Init(&g_sensor1)) {
+        g_motor1.state.motor_status = motor_init_failed;
         USB_Debug_Printf("Sensor_Init1 failed\r\n");
         return 0U;
     }
@@ -2002,10 +2077,12 @@ static uint8_t App_InitMotor1Stack(void)
     linkCurrentSense(&g_current_sense1, &g_motor1);
 
     MotorParam_Init(&g_motor1, 14.0f, 10.3f, 0.0f, 0.0f, 0.0f);
-    g_motor1.config.voltage_limit = g_driver1->voltage_limit;
-    g_motor1.config.voltage_sensor_align = g_driver1->voltage_limit;
     g_motor1.zero_electrical_angle = 0.0f;
-    g_motor1.state.sensor_direction = sensor_direction_cw;
+    if (!FOCMotor_ConfigureState(&g_motor1)) {
+        g_motor1.state.motor_status = motor_init_failed;
+        USB_Debug_Printf("FOCMotor_ConfigureState1 failed\r\n");
+        return 0U;
+    }
 #endif
     return 1U;
 }
@@ -2017,9 +2094,11 @@ static uint8_t App_InitMotor1Stack(void)
 static uint8_t App_InitMotor2Stack(void)
 {
 #if RIGHT_MOTOR_ENABLE
+    g_motor2.state.motor_status = motor_initializing;
     /* 右电机 Driver 初始化 */
     g_driver2 = Driver_GetInstance(DRIVER_RIGHT);
     if (g_driver2 == NULL) {
+        g_motor2.state.motor_status = motor_init_failed;
         USB_Debug_Printf("Driver_GetInstance2 failed\r\n");
         return 0U;
     }
@@ -2029,10 +2108,15 @@ static uint8_t App_InitMotor2Stack(void)
                      TIM_CHANNEL_4,
                      TIM_CHANNEL_3,
                      TIM_CHANNEL_2,
+                     Motor_EN_GPIO_Port,
+                     Motor_EN_Pin,
+                     1U,
                      19 * 0.577f)) {
+        g_motor2.state.motor_status = motor_init_failed;
         USB_Debug_Printf("Driver2_Init failed\r\n");
         return 0U;
     }
+    Driver_Disable(g_driver2);
 #if APP_BUS_VOLTAGE_FOC_ENABLE
     g_driver2->supply_voltage = g_bus_voltage_filtered;
 #else
@@ -2041,12 +2125,14 @@ static uint8_t App_InitMotor2Stack(void)
 
     /* 右编码器底层驱动 + Sensor 层初始化 */
     if (!AS5047P_RW_Init(&g_enc2, &hspi1, EcdR_CS_GPIO_Port, EcdR_CS_Pin)) {
+        g_motor2.state.motor_status = motor_init_failed;
         USB_Debug_Printf("AS5047P_RW_Init2 failed\r\n");
         return 0U;
     }
 
     Sensor_LinkAS5047P(&g_enc2, &g_sensor2);
     if (!Sensor_Init(&g_sensor2)) {
+        g_motor2.state.motor_status = motor_init_failed;
         USB_Debug_Printf("Sensor_Init2 failed\r\n");
         return 0U;
     }
@@ -2067,10 +2153,12 @@ static uint8_t App_InitMotor2Stack(void)
     linkCurrentSense(&g_current_sense2, &g_motor2);
 
     MotorParam_Init(&g_motor2, 14.0f, 10.3f, 0.0f, 0.0f, 0.0f);
-    g_motor2.config.voltage_limit = g_driver2->voltage_limit;
-    g_motor2.config.voltage_sensor_align = g_driver2->voltage_limit;
     g_motor2.zero_electrical_angle = 0.0f;
-    g_motor2.state.sensor_direction = sensor_direction_cw;
+    if (!FOCMotor_ConfigureState(&g_motor2)) {
+        g_motor2.state.motor_status = motor_init_failed;
+        USB_Debug_Printf("FOCMotor_ConfigureState2 failed\r\n");
+        return 0U;
+    }
 #endif
     return 1U;
 }
@@ -2104,8 +2192,8 @@ static uint8_t App_InitFOCAlgorithm(void)
         g_speed_fault2 = 0U;
 
         /* 速度反馈低通，当前截止频率 100Hz */
-        LowPassFilter_Init(&g_speed_lpf1, 100.0f, FOC_FREQUENCY);
-        LowPassFilter_Init(&g_speed_lpf2, 100.0f, FOC_FREQUENCY);
+        LowPassFilter_Init(&g_speed_lpf1, 50.0f, FOC_FREQUENCY);
+        LowPassFilter_Init(&g_speed_lpf2, 50.0f, FOC_FREQUENCY);
     #endif
 
 

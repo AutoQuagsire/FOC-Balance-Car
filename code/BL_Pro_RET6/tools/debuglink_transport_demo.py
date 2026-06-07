@@ -79,6 +79,7 @@ def main():
                 print(f"  pitch_rate_dps      = {f.pitch_rate_dps:+.2f}")
                 print(f"  speed_target_radps  = {f.speed_target_radps:+.3f}")
                 print(f"  speed_meas_radps    = {f.speed_meas_radps:+.3f}")
+                print(f"  speed_raw_radps     = {f.speed_raw_radps:+.3f}")
                 print(f"  attitude_p_iq_cmd_a = {f.attitude_p_iq_cmd_a:+.3f}")
                 print(f"  attitude_d_iq_cmd_a = {f.attitude_d_iq_cmd_a:+.3f}")
                 print(f"  iq_cmd_a            = {f.iq_cmd_a:+.3f}")

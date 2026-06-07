@@ -14,12 +14,15 @@ typedef struct {
     float output_limit;  // 输出限幅幅度
     float I_SEP_RATIO;  //积分带比例
     float I_ERR_MIN;//控制量量纲大小，避免积分带过窄
+    float unwind_gain; // per-loop integral unload gain
 } PID_t;
 
 #define PID_CURRENT_FREEZE_INTEGRAL   (0x01U)
 #define PID_CURRENT_LIMIT_I_UNLOAD    (0x02U)
 // PID控制函数
 void PID_Calculate(PID_t *pid, float target, float measure, uint8_t freeze_external);
+void PID_CalculateDt(PID_t *pid, float target, float measure, float dt, uint8_t freeze_external);
+float PID_SlewLimit(float prev_value, float target, float step_up_max, float step_down_max);
 void PID_CalculateTest(PID_t *pid, float target, float measure);
 void PID_CalculateIncrementalTest(PID_t *pid, float target, float measure);
 void PID_CalCurrent(PID_t *pid, float target, float measure, uint8_t freeze_external);

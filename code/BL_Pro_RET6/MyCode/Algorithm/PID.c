@@ -39,7 +39,7 @@ __attribute__((optimize("O2,fast-math")))
 void PID_Calculate(PID_t *pid, float target, float measure, uint8_t freeze_external)
 {
     float error = target - measure;
-    const float UNWIND_GAIN = 1.0f;
+    float unwind_gain;
     float i_band = pid->I_SEP_RATIO * fabsf(target);
     float derivative;
     float p_term;
@@ -51,6 +51,12 @@ void PID_Calculate(PID_t *pid, float target, float measure, uint8_t freeze_exter
     uint8_t allow_integrate;
     uint8_t allow_unwind;
     float i_term;
+
+    if (pid == NULL) {
+        return;
+    }
+
+    unwind_gain = (pid->unwind_gain > 0.0f) ? pid->unwind_gain : 1.0f;
 
     /* 积分分离阈值下限，避免 target 接近 0 时积分区间过小 */
     if (i_band < pid->I_ERR_MIN) {
@@ -79,7 +85,7 @@ void PID_Calculate(PID_t *pid, float target, float measure, uint8_t freeze_exter
     if (!freeze_integral && allow_integrate) {
         pid->error_integral += error;
     } else if (allow_unwind) {
-        pid->error_integral += UNWIND_GAIN * error;
+        pid->error_integral += unwind_gain * error;
     }
 
     /* 积分输出限幅，并反推 integral 状态，保证状态和输出一致 */
@@ -105,6 +111,114 @@ void PID_Calculate(PID_t *pid, float target, float measure, uint8_t freeze_exter
     }
 
     pid->last_error = error;
+}
+
+/*
+ * PID_CalculateDt():
+ * Same control logic as PID_Calculate(), but integral/derivative are
+ * normalized by dt to decouple tuning from loop rate.
+ */
+__attribute__((optimize("O2,fast-math")))
+void PID_CalculateDt(PID_t *pid, float target, float measure, float dt, uint8_t freeze_external)
+{
+    float error = target - measure;
+    float unwind_gain;
+    float i_band = 0.0f;
+    float dt_safe;
+    float derivative;
+    float p_term;
+    float d_term;
+    float i_term_pre;
+    float u_raw_pre;
+    uint8_t freeze_by_sat;
+    uint8_t freeze_integral;
+    uint8_t allow_integrate;
+    uint8_t allow_unwind;
+    float i_term;
+
+    if (pid == NULL) {
+        return;
+    }
+
+    unwind_gain = (pid->unwind_gain > 0.0f) ? pid->unwind_gain : 1.0f;
+    dt_safe = (dt > 1e-6f) ? dt : 1e-6f;
+    i_band = pid->I_SEP_RATIO * fabsf(target);
+
+    if (i_band < pid->I_ERR_MIN) {
+        i_band = pid->I_ERR_MIN;
+    }
+
+    derivative = (error - pid->last_error) / dt_safe;
+    p_term = pid->Kp * error;
+    d_term = pid->Kd * derivative;
+
+    i_term_pre = pid->Ki * pid->error_integral;
+    u_raw_pre = p_term + i_term_pre + d_term;
+
+    freeze_by_sat =
+        ((u_raw_pre > pid->output_limit) && (error > 0.0f)) ||
+        ((u_raw_pre < -pid->output_limit) && (error < 0.0f));
+
+    freeze_integral = (freeze_external || freeze_by_sat);
+    allow_integrate = (fabsf(error) <= i_band);
+    allow_unwind = (pid->error_integral * error < 0.0f);
+
+    if (!freeze_integral && allow_integrate) {
+        pid->error_integral += error * dt_safe;
+    } else if (allow_unwind) {
+        pid->error_integral += unwind_gain * error * dt_safe;
+    }
+
+    i_term = pid->Ki * pid->error_integral;
+    if (i_term > pid->integral_limit) {
+        if (fabsf(pid->Ki) > 1e-6f) {
+            pid->error_integral = pid->integral_limit / pid->Ki;
+        }
+    } else if (i_term < -pid->integral_limit) {
+        if (fabsf(pid->Ki) > 1e-6f) {
+            pid->error_integral = -pid->integral_limit / pid->Ki;
+        }
+    }
+
+    i_term = pid->Ki * pid->error_integral;
+    pid->output = p_term + i_term + d_term;
+
+    if (pid->output > pid->output_limit) {
+        pid->output = pid->output_limit;
+    } else if (pid->output < -pid->output_limit) {
+        pid->output = -pid->output_limit;
+    }
+
+    pid->last_error = error;
+}
+
+/*
+ * Generic asymmetric slew limiter.
+ *
+ * prev_value: previous value
+ * target: desired value
+ * step_up_max: max positive step per call
+ * step_down_max: max negative-step magnitude per call
+ *
+ * A non-positive step limit means that direction is unlimited.
+ */
+float PID_SlewLimit(float prev_value, float target, float step_up_max, float step_down_max)
+{
+    float delta = target - prev_value;
+    float up = fabsf(step_up_max);
+    float down = fabsf(step_down_max);
+
+    if (delta > 0.0f) {
+        if ((up > 0.0f) && (delta > up)) {
+            delta = up;
+        }
+    } else if (delta < 0.0f) {
+        if ((down > 0.0f) && ((-delta) > down)) {
+            delta = -down;
+        }
+    }
+
+    return prev_value + delta;
 }
 
 
@@ -164,7 +278,7 @@ __attribute__((optimize("O2,fast-math")))
 void PID_CalCurrent(PID_t *pid, float target, float measure, uint8_t freeze_external)
 {
     float error;
-    const float UNWIND_GAIN = 1.0f;
+    float unwind_gain;
     float i_band;
     float p_term;
     float i_term_pre;
@@ -182,6 +296,7 @@ void PID_CalCurrent(PID_t *pid, float target, float measure, uint8_t freeze_exte
         return;
     }
 
+    unwind_gain = (pid->unwind_gain > 0.0f) ? pid->unwind_gain : 1.0f;
     error = target - measure;
 
     /* 积分分离区间随目标电流幅值变化，并设置最小下限 */
@@ -212,7 +327,7 @@ void PID_CalCurrent(PID_t *pid, float target, float measure, uint8_t freeze_exte
     if (!freeze_integral && allow_integrate) {
         i_delta = error;
     } else if (allow_unwind) {
-        i_delta = UNWIND_GAIN * error;
+        i_delta = unwind_gain * error;
     }
 
     /* 目标阶跃阶段可限制积分卸载速度，降低反向下冲 */
@@ -341,10 +456,15 @@ void PID_CalculateIncrementalTest(PID_t *pid, float target, float measure)
 void PID_ParameterInitEx(PID_t *pid, float kp, float ki, float kd, float integral_limit,
                          float output_limit, float i_err_min, float i_sep_ratio)
 {
+    if (pid == NULL) {
+        return;
+    }
+
     pid->integral_limit = integral_limit;
     pid->output_limit = output_limit;
     pid->I_ERR_MIN = i_err_min;
     pid->I_SEP_RATIO = i_sep_ratio;
+    pid->unwind_gain = 1.0f;
     pid->Kp = kp;
     pid->Ki = ki;
     pid->Kd = kd;

@@ -1,7 +1,6 @@
 #include "debug_link.h"
+#include "debug_link_app_adapter.h"
 #include "debug_link_protocol.h"
-#include "app_attitude.h"
-#include "app_foc.h"
 #include "usart.h"
 
 #include <stddef.h>
@@ -141,6 +140,26 @@ static void DebugLink_SendNack(uint8_t req_msg, uint8_t reason)
     }
 }
 
+static void DebugLink_SendParamValueRsp(const DL_Frame_t *frame,
+                                        uint8_t param_id,
+                                        uint8_t data_type,
+                                        const uint8_t raw_bytes[4])
+{
+    uint8_t payload[6];
+    uint16_t len;
+
+    payload[0] = param_id;
+    payload[1] = data_type;
+    memcpy(&payload[2], raw_bytes, 4U);
+
+    len = DL_Protocol_BuildFrame(DL_MSG_PARAM_VALUE_RSP, frame->seq,
+                                 payload, sizeof(payload),
+                                 s_tx_buf, sizeof(s_tx_buf));
+    if (len > 0U) {
+        (void)DebugLink_TryTransmit(s_tx_buf, len);
+    }
+}
+
 static void DebugLink_HandleGetDeviceInfo(const DL_Frame_t *frame)
 {
     uint8_t payload[9];
@@ -156,7 +175,7 @@ static void DebugLink_HandleGetDeviceInfo(const DL_Frame_t *frame)
     payload[2] = DL_FW_MAJOR;
     payload[3] = DL_FW_MINOR;
     payload[4] = DL_FW_PATCH;
-    DL_WriteU16LE(&payload[5], DL_CAP_STATUS_STREAM |
+    DL_WriteU16LE(&payload[5], DL_CAP_STATUS_STREAM | DL_CAP_PARAM_READ | DL_CAP_PARAM_WRITE |
                                DL_CAP_POWER_STAGE_CONTROL | DL_CAP_ATTITUDE_CONTROL |
                                DL_CAP_FAST_RING);
     DL_WriteU16LE(&payload[7], DL_PROTO_MAX_PAYLOAD);
@@ -217,7 +236,7 @@ static void DebugLink_HandlePowerStageControl(const DL_Frame_t *frame)
         return;
     }
 
-    if (App_FOC_SetPowerStageEnabled(enable) == 0U) {
+    if (DebugLinkApp_SetPowerStageEnabled(enable) != DEBUG_LINK_APP_RESULT_OK) {
         DebugLink_SendNack(DL_MSG_POWER_STAGE_REQ, DL_NACK_BUSY);
         return;
     }
@@ -240,12 +259,64 @@ static void DebugLink_HandleAttitudeControl(const DL_Frame_t *frame)
         return;
     }
 
-    if (App_Attitude_SetControlEnabled(enable) == 0U) {
+    if (DebugLinkApp_SetAttitudeControlEnabled(enable) != DEBUG_LINK_APP_RESULT_OK) {
         DebugLink_SendNack(DL_MSG_ATTITUDE_CONTROL_REQ, DL_NACK_BUSY);
         return;
     }
 
     DebugLink_SendAck(DL_MSG_ATTITUDE_CONTROL_REQ, DL_ACK_STATUS_OK);
+}
+
+static void DebugLink_HandleGetParam(const DL_Frame_t *frame)
+{
+    uint8_t param_id;
+    uint8_t raw_bytes[4] = {0U, 0U, 0U, 0U};
+    uint8_t data_type = 0U;
+    uint8_t result;
+
+    if (frame->payload_len != 1U) {
+        DebugLink_SendNack(DL_MSG_GET_PARAM_REQ, DL_NACK_BAD_LENGTH);
+        return;
+    }
+
+    param_id = frame->payload[0];
+    result = DebugLinkApp_GetParam(param_id, &data_type, raw_bytes);
+    if (result == DEBUG_LINK_APP_RESULT_BAD_PARAM_ID) {
+        DebugLink_SendNack(DL_MSG_GET_PARAM_REQ, DL_NACK_BAD_PARAM_ID);
+        return;
+    }
+    if (result != DEBUG_LINK_APP_RESULT_OK) {
+        DebugLink_SendNack(DL_MSG_GET_PARAM_REQ, DL_NACK_BAD_PARAM_VALUE);
+        return;
+    }
+
+    DebugLink_SendParamValueRsp(frame, param_id, data_type, raw_bytes);
+}
+
+static void DebugLink_HandleSetParam(const DL_Frame_t *frame)
+{
+    uint8_t param_id;
+    uint8_t data_type;
+    uint8_t result;
+
+    if (frame->payload_len != 6U) {
+        DebugLink_SendNack(DL_MSG_SET_PARAM_REQ, DL_NACK_BAD_LENGTH);
+        return;
+    }
+
+    param_id = frame->payload[0];
+    data_type = frame->payload[1];
+    result = DebugLinkApp_SetParam(param_id, data_type, &frame->payload[2]);
+    if (result == DEBUG_LINK_APP_RESULT_BAD_PARAM_ID) {
+        DebugLink_SendNack(DL_MSG_SET_PARAM_REQ, DL_NACK_BAD_PARAM_ID);
+        return;
+    }
+    if (result != DEBUG_LINK_APP_RESULT_OK) {
+        DebugLink_SendNack(DL_MSG_SET_PARAM_REQ, DL_NACK_BAD_PARAM_VALUE);
+        return;
+    }
+
+    DebugLink_SendAck(DL_MSG_SET_PARAM_REQ, DL_ACK_STATUS_OK);
 }
 
 #define DL_FASTRING_OP_STATUS     0x01U
@@ -269,18 +340,15 @@ static void DebugLink_HandleFastRing(const DL_Frame_t *frame)
     {
     case DL_FASTRING_OP_STATUS:
     {
-        uint16_t count;
-        uint16_t capacity;
-        uint16_t head;
-        uint32_t write_seq;
+        DebugLinkApp_FastRingStatus_t status;
         uint8_t payload[12];
 
-        App_GetFastRingStatus(&count, &capacity, &head, &write_seq);
+        DebugLinkApp_GetFastRingStatus(&status);
         payload[0] = DL_FASTRING_OP_STATUS;
-        DL_WriteU16LE(&payload[1], count);
-        DL_WriteU16LE(&payload[3], capacity);
-        DL_WriteU16LE(&payload[5], head);
-        DL_WriteU32LE(&payload[7], write_seq);
+        DL_WriteU16LE(&payload[1], status.count);
+        DL_WriteU16LE(&payload[3], status.capacity);
+        DL_WriteU16LE(&payload[5], status.head);
+        DL_WriteU32LE(&payload[7], status.write_seq);
 
         len = DL_Protocol_BuildFrame(DL_MSG_FAST_RING_DATA, frame->seq,
                                      payload, 11U,
@@ -293,17 +361,15 @@ static void DebugLink_HandleFastRing(const DL_Frame_t *frame)
 
     case DL_FASTRING_OP_SNAPSHOT:
     {
-        uint16_t count;
-        uint16_t capacity;
-        uint32_t snapshot_write_seq_live;
+        DebugLinkApp_FastRingStatus_t status;
         uint8_t payload[12];
 
-        App_SnapshotFastRing(&count, &capacity, &snapshot_write_seq_live);
+        DebugLinkApp_SnapshotFastRing(&status);
         payload[0] = DL_FASTRING_OP_SNAPSHOT;
-        DL_WriteU16LE(&payload[1], count);
-        DL_WriteU16LE(&payload[3], capacity);
-        DL_WriteU16LE(&payload[5], 0U);
-        DL_WriteU32LE(&payload[7], snapshot_write_seq_live);
+        DL_WriteU16LE(&payload[1], status.count);
+        DL_WriteU16LE(&payload[3], status.capacity);
+        DL_WriteU16LE(&payload[5], status.head);
+        DL_WriteU32LE(&payload[7], status.write_seq);
 
         len = DL_Protocol_BuildFrame(DL_MSG_FAST_RING_DATA, frame->seq,
                                      payload, 11U,
@@ -319,13 +385,11 @@ static void DebugLink_HandleFastRing(const DL_Frame_t *frame)
         uint16_t start_idx;
         uint8_t max_samples;
         uint32_t snapshot_write_seq;
-        uint16_t count;
-        uint16_t capacity;
-        uint32_t write_seq;
+        DebugLinkApp_FastRingStatus_t status;
         uint16_t sample_count;
         uint16_t i;
         uint8_t payload[DL_PROTO_MAX_PAYLOAD];
-        FastRingSample_t chunk[DL_FASTRING_MAX_SAMPLES_PER_CHUNK];
+        DebugLinkApp_FastRingSample_t chunk[DL_FASTRING_MAX_SAMPLES_PER_CHUNK];
 
         if (frame->payload_len < 8U) {
             DebugLink_SendNack(DL_MSG_FAST_RING_REQ, DL_NACK_BAD_LENGTH);
@@ -339,13 +403,13 @@ static void DebugLink_HandleFastRing(const DL_Frame_t *frame)
             max_samples = DL_FASTRING_MAX_SAMPLES_PER_CHUNK;
         }
 
-        App_GetFastRingSnapshotStatus(&count, &capacity, &write_seq);
-        sample_count = App_CopyFastRingSnapshotChunk(snapshot_write_seq, start_idx, max_samples, chunk);
+        DebugLinkApp_GetFastRingSnapshotStatus(&status);
+        sample_count = DebugLinkApp_CopyFastRingSnapshotChunk(snapshot_write_seq, start_idx, max_samples, chunk);
 
         payload[0] = DL_FASTRING_OP_READ_CHUNK;
-        DL_WriteU16LE(&payload[1], count);
-        DL_WriteU16LE(&payload[3], capacity);
-        DL_WriteU32LE(&payload[5], write_seq);
+        DL_WriteU16LE(&payload[1], status.count);
+        DL_WriteU16LE(&payload[3], status.capacity);
+        DL_WriteU32LE(&payload[5], status.write_seq);
         DL_WriteU16LE(&payload[9], start_idx);
         payload[11] = (uint8_t)sample_count;
 
@@ -385,7 +449,7 @@ static void DebugLink_HandleFastRing(const DL_Frame_t *frame)
 
 static void DebugLink_SendStatusStream(void)
 {
-    uint8_t payload[42];
+    uint8_t payload[44];
     uint16_t len;
     DebugLink_StatusSnapshot_t st;
 
@@ -399,8 +463,8 @@ static void DebugLink_SendStatusStream(void)
     DL_WriteU16LE(&payload[8], (uint16_t)st.speed_i_term_deg_x100);
     DL_WriteU16LE(&payload[10], (uint16_t)st.pitch_meas_deg_x100);
     DL_WriteU16LE(&payload[12], (uint16_t)st.pitch_rate_dps_x100);
-    DL_WriteU16LE(&payload[14], (uint16_t)st.speed_target_radps_x1000);
-    DL_WriteU16LE(&payload[16], (uint16_t)st.speed_meas_radps_x1000);
+    DL_WriteU16LE(&payload[14], (uint16_t)st.speed_target_radps_x100);
+    DL_WriteU16LE(&payload[16], (uint16_t)st.speed_meas_radps_x100);
     DL_WriteU16LE(&payload[18], (uint16_t)st.attitude_p_term_ma);
     DL_WriteU16LE(&payload[20], (uint16_t)st.attitude_d_term_ma);
     DL_WriteU16LE(&payload[22], (uint16_t)st.iq_cmd_ma);
@@ -413,6 +477,7 @@ static void DebugLink_SendStatusStream(void)
     DL_WriteU16LE(&payload[36], (uint16_t)st.uq_r_mv);
     DL_WriteU16LE(&payload[38], st.bus_mv);
     DL_WriteU16LE(&payload[40], st.fault_flags);
+    DL_WriteU16LE(&payload[42], (uint16_t)st.speed_raw_radps_x100);
 
     len = DL_Protocol_BuildFrame(DL_MSG_STATUS_STREAM, 0U,
                                  payload, sizeof(payload),
@@ -452,6 +517,18 @@ static void DebugLink_ProcessRxFrame(void)
 
     case DL_MSG_STREAM_CONTROL_REQ:
         DebugLink_HandleStreamControl(&frame);
+        break;
+
+    case DL_MSG_GET_PARAM_REQ:
+        DebugLink_HandleGetParam(&frame);
+        break;
+
+    case DL_MSG_SET_PARAM_REQ:
+        DebugLink_HandleSetParam(&frame);
+        break;
+
+    case DL_MSG_SAVE_PARAMS_REQ:
+        DebugLink_SendNack(DL_MSG_SAVE_PARAMS_REQ, DL_NACK_UNSUPPORTED);
         break;
 
     case DL_MSG_POWER_STAGE_REQ:

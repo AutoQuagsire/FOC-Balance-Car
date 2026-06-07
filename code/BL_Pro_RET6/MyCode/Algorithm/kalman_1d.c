@@ -6,7 +6,6 @@
 
 
 static float R_normal = 3e-3f;
-static float R_large = 2e-2f;
 
 void Kalman1D_Init(Kalman1D_t *kf, float init_angle_rad, float init_bias_radps)
 {

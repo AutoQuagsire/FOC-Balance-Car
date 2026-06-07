@@ -4,3 +4,10 @@ mx.scratch
 .idea/
 tools/__pycache__/
 current_loop_data/*.csv
+.venv-gui-pack39/
+dist/
+dist_nuitka/
+tools/DebugLinkGUI.dist/
+DebugLinkGUI.spec
+tools/pysidedeploy.spec
+stream_data/

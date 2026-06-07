@@ -279,17 +279,11 @@ uint8_t FOCMotor_init(Motor_t *FOC_Motor)
      * 则给一个默认方向，避免后续控制逻辑没有方向信息。
      */
     if ((FOC_Motor->state.has_sensor == 0U) &&
-        ((FOC_Motor->config.control_mode == motor_control_openloop_angle) ||
-         (FOC_Motor->config.control_mode == motor_control_openloop_velocity)) &&
+        (FOC_Motor->config.outer_loop == motor_outer_openloop_velocity) &&
         (FOC_Motor->state.sensor_direction == sensor_direction_unknown)) {
         FOC_Motor->state.sensor_direction = sensor_direction_cw;
     }
-
     /* 使能前后给一点延时，给驱动芯片和 PWM 输出状态稳定的时间 */
-    Platform_DelayMs(10);
-    FOCMotor_enable(FOC_Motor);
-    Platform_DelayMs(10);
-
     /* 初始化完成后，电机还没有做零位电角度校准 */
     FOC_Motor->state.motor_status = motor_uncalibrated;
 
@@ -309,6 +303,49 @@ uint8_t FOCMotor_init(Motor_t *FOC_Motor)
  * 设计原则：
  * 先去能量，再断执行链。
  * ============================================================ */
+uint8_t FOCMotor_ConfigureState(Motor_t *motor)
+{
+    if (motor == NULL) {
+        return 0U;
+    }
+    if ((motor->driver == NULL) || (motor->driver->initialized == 0U)) {
+        return 0U;
+    }
+
+    if ((motor->sensor != NULL) && (motor->sensor->initialized != 0U)) {
+        motor->state.has_sensor = 1U;
+    } else {
+        motor->state.has_sensor = 0U;
+    }
+
+    motor->state.motor_status = motor_initializing;
+
+    if (motor->config.voltage_limit <= 0.0f) {
+        motor->config.voltage_limit = motor->driver->voltage_limit;
+    } else if (motor->config.voltage_limit > motor->driver->voltage_limit) {
+        motor->config.voltage_limit = motor->driver->voltage_limit;
+    }
+
+    if (motor->config.voltage_sensor_align <= 0.0f) {
+        motor->config.voltage_sensor_align = motor->config.voltage_limit;
+    } else if (motor->config.voltage_sensor_align > motor->config.voltage_limit) {
+        motor->config.voltage_sensor_align = motor->config.voltage_limit;
+    }
+
+    if ((motor->param.Ld == 0.0f) && (motor->param.Lq != 0.0f)) {
+        motor->param.Ld = motor->param.Lq;
+    } else if ((motor->param.Lq == 0.0f) && (motor->param.Ld != 0.0f)) {
+        motor->param.Lq = motor->param.Ld;
+    }
+
+    if (motor->state.sensor_direction == sensor_direction_unknown) {
+        motor->state.sensor_direction = sensor_direction_cw;
+    }
+
+    motor->state.motor_status = motor_uncalibrated;
+    return 1U;
+}
+
 void FOCMotor_disable(Motor_t *motor)
 {
     if (!motor || !motor->driver) return;

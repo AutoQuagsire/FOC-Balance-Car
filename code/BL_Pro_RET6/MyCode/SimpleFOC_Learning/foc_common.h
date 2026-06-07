@@ -1,17 +1,43 @@
 #ifndef FOC_COMMON_H
 #define FOC_COMMON_H
 
-/* Control-loop timing */
+#include <stdint.h>
+#include "main.h"
+
+typedef struct {
+    float g_foc_frequency;
+    float g_foc_period_s;
+    uint32_t g_foc_period_us;
+    TIM_HandleTypeDef *g_foc_it_timer;
+} FocFrequency_t;
+
+/* Control-loop timing defaults.
+ * The runtime values can be updated from an interrupt timer by app_foc_new.c.
+ */
+#ifndef FOC_FREQUENCY_DEFAULT
+#define FOC_FREQUENCY_DEFAULT 10000.0f
+#endif
+
+#ifndef FOC_PERIOD_S_DEFAULT
+#define FOC_PERIOD_S_DEFAULT (1.0f / FOC_FREQUENCY_DEFAULT)
+#endif
+
+#ifndef FOC_PERIOD_US_DEFAULT
+#define FOC_PERIOD_US_DEFAULT 100U
+#endif
+
+extern FocFrequency_t g_foc;
+
 #ifndef FOC_FREQUENCY
-#define FOC_FREQUENCY 10000.0f
+#define FOC_FREQUENCY (g_foc.g_foc_frequency)
 #endif
 
 #ifndef FOC_PERIOD_S
-#define FOC_PERIOD_S (1.0f / FOC_FREQUENCY)
+#define FOC_PERIOD_S (g_foc.g_foc_period_s)
 #endif
 
 #ifndef FOC_PERIOD_US
-#define FOC_PERIOD_US 100U
+#define FOC_PERIOD_US (g_foc.g_foc_period_us)
 #endif
 
 /* Math / modulation constants */
@@ -19,8 +45,14 @@
 #define PI 3.14159265359f
 #endif
 
+static inline float normalizeAngle(float angle)
+{
+    float a = angle - (float)(int32_t)(angle * (1.0f / (2.0f * PI))) * (2.0f * PI);
+    return (a >= 0.0f) ? a : (a + 2.0f * PI);
+}
+
 #ifndef V_SUPPLY
-#define V_SUPPLY 19.5f
+#define V_SUPPLY 12.0f
 #endif
 
 #ifndef Uq_max

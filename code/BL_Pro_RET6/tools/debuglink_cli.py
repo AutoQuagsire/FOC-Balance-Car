@@ -61,6 +61,36 @@ FOC_STATUS_FLAG_CURRENT_LOOP_ENABLED = 1 << 13
 FOC_STATUS_FLAG_POWER_STAGE_OFF = 1 << 14
 FOC_STATUS_FLAG_ATTITUDE_CONTROL_ON = 1 << 15
 
+# ── Parameter protocol ───────────────────────────────────────────────
+MSG_GET_PARAM_REQ   = 0x11
+MSG_SET_PARAM_REQ   = 0x12
+MSG_SAVE_PARAMS_REQ = 0x13
+MSG_PARAM_VALUE_RSP = 0x83
+
+PARAM_TYPE_FLOAT = 0x01
+PARAM_TYPE_UINT8 = 0x02
+
+# name → (id, type, scale, description)
+PARAM_TABLE = {
+    "current_kp":           (0x01, "float", 1.0, "Current loop Kp"),
+    "current_ki":           (0x02, "float", 1.0, "Current loop Ki"),
+    "current_kd":           (0x03, "float", 1.0, "Current loop Kd"),
+    "current_ilim":         (0x04, "float", 1.0, "Current loop ILim (A)"),
+    "current_output_limit": (0x05, "float", 1.0, "Current loop output limit"),
+    "current_i_err_min":    (0x06, "float", 1.0, "Current loop I_ERR_MIN"),
+    "current_i_sep_ratio":  (0x07, "float", 1.0, "Current loop I_SEP_RATIO"),
+    "current_mode":         (0x08, "uint8", 1.0, "Current PID mode (0=FFPI_V1, 1=Pure PI)"),
+    "speed_kp":             (0x10, "float", 1.0, "Speed loop Kp (rad/radps)"),
+    "speed_ki":             (0x11, "float", 1.0, "Speed loop Ki (rad/rad)"),
+    "speed_pitch_limit":    (0x12, "float", 1.0, "Speed loop pitch limit (rad)"),
+    "speed_unwind_gain":    (0x13, "float", 1.0, "Speed loop integral unwind gain"),
+    "attitude_kp":          (0x20, "float", 1.0, "Attitude loop Kp (A/rad)"),
+    "attitude_kd":          (0x21, "float", 1.0, "Attitude loop Kd (A/radps)"),
+    "attitude_iq_limit":    (0x22, "float", 1.0, "Attitude loop Iq limit (A)"),
+    "attitude_shutdown_rad":(0x23, "float", 1.0, "Attitude shutdown angle (rad)"),
+}
+PARAM_BY_ID = {v[0]: (k, *v[1:]) for k, v in PARAM_TABLE.items()}
+
 DEFAULT_OPEN_RETRIES = 3
 DEFAULT_CMD_RETRIES = 3
 DEFAULT_SETTLE_MS = 80
@@ -453,6 +483,7 @@ def cmd_stream(ser: serial.Serial, rate: int, retries: int, retry_delay_ms: int)
         pitch_rate = frame.pitch_rate_dps
         speed_target = frame.speed_target_radps
         speed_meas = frame.speed_meas_radps
+        speed_raw = frame.speed_raw_radps
         attitude_p_term = frame.attitude_p_iq_cmd_a
         attitude_d_term = frame.attitude_d_iq_cmd_a
         iq_cmd = frame.iq_cmd_a
@@ -473,6 +504,7 @@ def cmd_stream(ser: serial.Serial, rate: int, retries: int, retry_delay_ms: int)
             f"speed_i_term={speed_i_term:>+6.2f}deg "
             f"pitch_meas={pitch_meas:>+6.2f}deg pitch_rate={pitch_rate:>+7.2f}dps "
             f"speed_target={speed_target:>+6.3f} speed_meas={speed_meas:>+6.3f} "
+            f"speed_raw={speed_raw:>+6.3f} "
             f"attitude_p_term={attitude_p_term:>+5.3f} "
             f"attitude_d_term={attitude_d_term:>+5.3f} "
             f"iq_cmd={iq_cmd:>+5.3f} iq_cmd_clamped={iq_cmd_clamped:>+5.3f} "
@@ -804,6 +836,187 @@ def write_fastring_side_csv(all_samples, source: int, snapshot_write_seq: int, o
             )
 
 
+# ── Parameter helpers ────────────────────────────────────────────────
+
+def _resolve_param(spec: str):
+    """Resolve parameter name or hex ID string to (param_id, type, scale, name)."""
+    if spec in PARAM_TABLE:
+        pid, ptype, scale, _desc = PARAM_TABLE[spec]
+        return pid, ptype, scale, spec
+    try:
+        pid = int(spec, 0)
+    except ValueError:
+        pass
+    else:
+        entry = PARAM_BY_ID.get(pid)
+        if entry is not None:
+            name, ptype, scale, _desc = entry
+            return pid, ptype, scale, name
+    raise ValueError(
+        f"unknown parameter: {spec!r} — use 'param list' to see valid names and IDs"
+    )
+
+
+# ── Parameter commands ───────────────────────────────────────────────
+
+def cmd_param_list():
+    """Print the local parameter table (no device communication)."""
+    print(f"{'ID':6s} {'NAME':27s} {'TYPE':6s}  DESCRIPTION")
+    print("-" * 75)
+    for name, (pid, ptype, _scale, desc) in sorted(PARAM_TABLE.items(),
+                                                     key=lambda kv: kv[1][0]):
+        print(f"0x{pid:02X}  {name:27s} {ptype:6s}  {desc}")
+    return True
+
+
+def cmd_param_get(ser: serial.Serial, param_spec: str,
+                  retries: int, retry_delay_ms: int):
+    """Send GET_PARAM_REQ and print the PARAM_VALUE_RSP."""
+    try:
+        pid, ptype, scale, name = _resolve_param(param_spec)
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        return False
+
+    reader = FrameReader()
+    seq = 0x20
+    frame = build_frame(MSG_GET_PARAM_REQ, seq, bytes([pid]))
+
+    print(f"[TX] GET_PARAM_REQ {name} (0x{pid:02X})")
+    result = send_frame_and_wait(
+        ser, reader, frame, "GET_PARAM_REQ",
+        2.0, retries, retry_delay_ms,
+        accept_fn=lambda r: r[0] in (MSG_PARAM_VALUE_RSP, MSG_NACK),
+    )
+    if result is None:
+        return False
+
+    msg_type, _, pld = result
+    if msg_type == MSG_NACK:
+        reason = pld[1] if len(pld) >= 2 else "?"
+        print(f"[RX] NACK req=0x{pld[0]:02X} reason={reason}")
+        return False
+
+    if len(pld) < 6:
+        print(f"[WARN] short PARAM_VALUE_RSP: {len(pld)} bytes")
+        return False
+
+    resp_id = pld[0]
+    resp_type = pld[1]
+    raw_bytes = pld[2:6]
+
+    if resp_type == PARAM_TYPE_FLOAT:
+        raw_val = struct.unpack_from("<f", raw_bytes, 0)[0]
+        scaled = raw_val * scale
+        raw_disp = f"0x{raw_bytes.hex()}"
+        val_disp = f"{scaled:.6f}"
+    elif resp_type == PARAM_TYPE_UINT8:
+        raw_val = raw_bytes[0]
+        scaled = raw_val * scale
+        raw_disp = str(int(raw_val))
+        val_disp = str(int(scaled))
+    else:
+        print(f"[WARN] unknown data_type=0x{resp_type:02X} in response")
+        return False
+
+    resp_name = PARAM_BY_ID.get(resp_id, (f"0x{resp_id:02X}",))[0]
+    print(f"[RX] PARAM_VALUE_RSP id=0x{resp_id:02X} name={resp_name} "
+          f"raw={raw_disp} value={val_disp}")
+    return True
+
+
+def cmd_param_set(ser: serial.Serial, param_spec: str, value_str: str,
+                  retries: int, retry_delay_ms: int):
+    """Send SET_PARAM_REQ and wait for ACK/NACK."""
+    try:
+        pid, ptype, scale, name = _resolve_param(param_spec)
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        return False
+
+    if ptype == "float":
+        user_val = float(value_str)
+        raw_val = user_val / scale
+        payload = struct.pack("<BBf", pid, PARAM_TYPE_FLOAT, raw_val)
+    else:  # uint8
+        user_val = float(value_str)
+        raw_val = int(user_val / scale)
+        if raw_val < 0 or raw_val > 255:
+            print(f"[ERROR] uint8 value out of range: {raw_val} (from {value_str!r})")
+            return False
+        payload = struct.pack("<BBB3x", pid, PARAM_TYPE_UINT8, raw_val)
+
+    reader = FrameReader()
+    seq = 0x21
+    frame = build_frame(MSG_SET_PARAM_REQ, seq, payload)
+
+    print(f"[TX] SET_PARAM_REQ {name} (0x{pid:02X}) = {value_str}")
+    result = send_frame_and_wait(
+        ser, reader, frame, "SET_PARAM_REQ",
+        2.0, retries, retry_delay_ms,
+        accept_fn=lambda r: r[0] in (MSG_ACK, MSG_NACK),
+    )
+    if result is None:
+        return False
+
+    msg_type, _, pld = result
+    if msg_type == MSG_ACK and len(pld) >= 2:
+        print(f"[RX] ACK req=0x{pld[0]:02X} status={pld[1]}  ({name} updated)")
+        return True
+
+    if msg_type == MSG_NACK and len(pld) >= 2:
+        print(f"[RX] NACK req=0x{pld[0]:02X} reason={pld[1]}")
+        return False
+
+    print(f"[RX] unexpected: msg=0x{msg_type:02X}")
+    return False
+
+
+def cmd_param_dump(ser: serial.Serial, retries: int, retry_delay_ms: int):
+    """Iterate all known parameters, GET each one, and print a table."""
+    reader = FrameReader()
+    ok_all = True
+
+    print(f"{'NAME':27s} {'VALUE':16s}")
+    print("-" * 45)
+
+    for name, (pid, ptype, scale, _desc) in sorted(PARAM_TABLE.items(),
+                                                     key=lambda kv: kv[1][0]):
+        seq = (0x30 + pid) & 0xFF
+        frame = build_frame(MSG_GET_PARAM_REQ, seq, bytes([pid]))
+
+        result = send_frame_and_wait(
+            ser, reader, frame, f"GET_PARAM {name}",
+            1.0, retries, retry_delay_ms,
+            accept_fn=lambda r: r[0] in (MSG_PARAM_VALUE_RSP, MSG_NACK),
+        )
+        if result is None:
+            print(f"  {name:27s} [timeout]")
+            ok_all = False
+            continue
+
+        msg_type, _, pld = result
+        if msg_type == MSG_NACK:
+            reason = pld[1] if len(pld) >= 2 else "?"
+            print(f"  {name:27s} [NACK reason={reason}]")
+            ok_all = False
+            continue
+
+        if len(pld) < 6:
+            print(f"  {name:27s} [short payload: {len(pld)}B]")
+            ok_all = False
+            continue
+
+        if ptype == "float":
+            raw_val = struct.unpack_from("<f", pld, 2)[0]
+            print(f"  {name:27s} = {raw_val * scale:.6f}")
+        else:
+            raw_val = pld[2]
+            print(f"  {name:27s} = {int(raw_val * scale)}")
+
+    return ok_all
+
+
 def main():
     parser = argparse.ArgumentParser(description="DebugLink CLI")
     parser.add_argument("--port", required=True, help="Serial port (e.g. COM33)")
@@ -859,11 +1072,27 @@ def main():
     p_fr_split.add_argument("--left-out", required=True, help="Left motor output CSV path")
     p_fr_split.add_argument("--right-out", required=True, help="Right motor output CSV path")
 
+    # ── param ──
+    p_param = sub.add_parser("param", help="Read/write runtime parameters")
+    param_sub = p_param.add_subparsers(dest="param_op")
+    param_sub.add_parser("list", help="List known parameters (local table, no device I/O)")
+    p_pget = param_sub.add_parser("get", help="Read one parameter value from device")
+    p_pget.add_argument("param", help="Parameter name or hex ID  (e.g. current_kp or 0x01)")
+    p_pset = param_sub.add_parser("set", help="Write one parameter value on device")
+    p_pset.add_argument("param", help="Parameter name or hex ID")
+    p_pset.add_argument("value", help="New value (float for float params, int for uint8)")
+    param_sub.add_parser("dump", help="Read all known parameters from device and print table")
+
     args = parser.parse_args()
 
     if args.command is None:
         parser.print_help()
         sys.exit(1)
+
+    # Commands that do not require a serial connection
+    if args.command == "param" and args.param_op == "list":
+        cmd_param_list()
+        sys.exit(0)
 
     ser = None
     ok = False
@@ -899,6 +1128,19 @@ def main():
                     args.retries,
                     args.retry_delay_ms,
                 )
+        elif args.command == "param":
+            if args.param_op is None:
+                p_param.print_help()
+                sys.exit(1)
+            if args.param_op == "list":
+                ok = cmd_param_list()
+            elif args.param_op == "get":
+                ok = cmd_param_get(ser, args.param, args.retries, args.retry_delay_ms)
+            elif args.param_op == "set":
+                ok = cmd_param_set(ser, args.param, args.value,
+                                   args.retries, args.retry_delay_ms)
+            elif args.param_op == "dump":
+                ok = cmd_param_dump(ser, args.retries, args.retry_delay_ms)
     except serial.SerialException as e:
         print(f"[ERROR] {e}")
     finally:

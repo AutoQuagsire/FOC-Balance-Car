@@ -508,8 +508,4 @@ uint8_t AS5047P_RW_Init(AS5047P_Handle_t *dev,
     return 1U;
 }
 
-float normalizeAngle(float angle)
-{
-    float a = angle - (float)(int32_t)(angle * (1.0f / (2.0f * PI))) * (2.0f * PI);
-    return (a >= 0.0f) ? a : (a + 2.0f * PI);
-}
+

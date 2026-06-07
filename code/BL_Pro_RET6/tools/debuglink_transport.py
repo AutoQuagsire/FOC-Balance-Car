@@ -41,14 +41,26 @@ MAX_PAYLOAD = 240
 MSG_PING_REQ = 0x01
 MSG_GET_DEVICE_INFO_REQ = 0x02
 MSG_STREAM_CONTROL_REQ = 0x10
+MSG_GET_PARAM_REQ = 0x11
+MSG_SET_PARAM_REQ = 0x12
 MSG_POWER_STAGE_REQ = 0x15
 MSG_ATTITUDE_CONTROL_REQ = 0x16
 MSG_FAST_RING_REQ = 0x17
 MSG_ACK = 0x80
 MSG_NACK = 0x81
 MSG_DEVICE_INFO_RSP = 0x82
+MSG_PARAM_VALUE_RSP = 0x83
 MSG_STATUS_STREAM = 0x90
 MSG_FAST_RING_DATA = 0x93
+
+PARAM_TYPE_FLOAT = 0x01
+PARAM_SPEED_KP = 0x10
+PARAM_SPEED_KI = 0x11
+PARAM_SPEED_UNWIND_GAIN = 0x13
+PARAM_ATTITUDE_KP = 0x20
+PARAM_ATTITUDE_KD = 0x21
+PARAM_ATTITUDE_IQ_LIMIT = 0x22
+PARAM_ATTITUDE_SHUTDOWN_RAD = 0x23
 
 OP_FASTRING_STATUS = 0x01
 OP_FASTRING_SNAPSHOT = 0x02
@@ -323,6 +335,134 @@ class DebugLinkTransport:
         if msg_type == MSG_ACK and len(resp) >= 2:
             return resp[0] == MSG_PING_REQ and resp[1] == 0
         return False
+
+    def _set_bool_control(self, req_msg: int, enable: bool) -> bool:
+        payload = struct.pack("<B", 1 if enable else 0)
+        try:
+            msg_type, resp = self._request(
+                req_msg,
+                payload,
+                accept_fn=lambda mt: mt in (MSG_ACK, MSG_NACK),
+            )
+        except TransportError:
+            return False
+
+        if msg_type == MSG_ACK and len(resp) >= 2:
+            return resp[0] == req_msg and resp[1] == 0
+        return False
+
+    def driver_enable(self, enable: bool) -> bool:
+        """Enable or disable the power stage driver."""
+        return self._set_bool_control(MSG_POWER_STAGE_REQ, enable)
+
+    def balance_enable(self, enable: bool) -> bool:
+        """Enable or disable attitude/speed balance control."""
+        return self._set_bool_control(MSG_ATTITUDE_CONTROL_REQ, enable)
+
+    def get_float_param(self, param_id: int) -> float:
+        """Read a float parameter by DebugLink parameter ID."""
+        msg_type, resp = self._request(
+            MSG_GET_PARAM_REQ,
+            struct.pack("<B", param_id),
+            accept_fn=lambda mt: mt in (MSG_PARAM_VALUE_RSP, MSG_NACK),
+        )
+
+        if msg_type == MSG_NACK:
+            reason = resp[1] if len(resp) >= 2 else 0
+            raise TransportError(
+                f"get_param 0x{param_id:02X} NACK reason={reason}"
+            )
+
+        if msg_type != MSG_PARAM_VALUE_RSP or len(resp) < 6:
+            raise TransportError(
+                f"get_param 0x{param_id:02X} unexpected response: "
+                f"msg=0x{msg_type:02X} len={len(resp)}"
+            )
+
+        resp_id = resp[0]
+        data_type = resp[1]
+        if resp_id != param_id or data_type != PARAM_TYPE_FLOAT:
+            raise TransportError(
+                f"get_param 0x{param_id:02X} mismatched response: "
+                f"id=0x{resp_id:02X} type=0x{data_type:02X}"
+            )
+
+        return struct.unpack_from("<f", resp, 2)[0]
+
+    def set_float_param(self, param_id: int, value: float) -> bool:
+        """Write a float parameter by DebugLink parameter ID."""
+        payload = struct.pack("<BBf", param_id, PARAM_TYPE_FLOAT, float(value))
+        msg_type, resp = self._request(
+            MSG_SET_PARAM_REQ,
+            payload,
+            accept_fn=lambda mt: mt in (MSG_ACK, MSG_NACK),
+        )
+
+        if msg_type == MSG_NACK:
+            reason = resp[1] if len(resp) >= 2 else 0
+            raise TransportError(
+                f"set_param 0x{param_id:02X} NACK reason={reason}"
+            )
+
+        if msg_type == MSG_ACK and len(resp) >= 2:
+            return resp[0] == MSG_SET_PARAM_REQ and resp[1] == 0
+        return False
+
+    def get_speed_ki(self) -> float:
+        """Read speed loop Ki (rad/rad)."""
+        return self.get_float_param(PARAM_SPEED_KI)
+
+    def set_speed_ki(self, value: float) -> bool:
+        """Write speed loop Ki (rad/rad)."""
+        return self.set_float_param(PARAM_SPEED_KI, value)
+
+    def get_speed_kp(self) -> float:
+        """Read speed loop Kp (rad/radps)."""
+        return self.get_float_param(PARAM_SPEED_KP)
+
+    def set_speed_kp(self, value: float) -> bool:
+        """Write speed loop Kp (rad/radps)."""
+        return self.set_float_param(PARAM_SPEED_KP, value)
+
+    def get_speed_unwind_gain(self) -> float:
+        """Read speed loop integral unwind gain."""
+        return self.get_float_param(PARAM_SPEED_UNWIND_GAIN)
+
+    def set_speed_unwind_gain(self, value: float) -> bool:
+        """Write speed loop integral unwind gain."""
+        return self.set_float_param(PARAM_SPEED_UNWIND_GAIN, value)
+
+    def get_attitude_kp(self) -> float:
+        """Read attitude loop Kp (A/rad)."""
+        return self.get_float_param(PARAM_ATTITUDE_KP)
+
+    def set_attitude_kp(self, value: float) -> bool:
+        """Write attitude loop Kp (A/rad)."""
+        return self.set_float_param(PARAM_ATTITUDE_KP, value)
+
+    def get_attitude_kd(self) -> float:
+        """Read attitude loop Kd (A/radps)."""
+        return self.get_float_param(PARAM_ATTITUDE_KD)
+
+    def set_attitude_kd(self, value: float) -> bool:
+        """Write attitude loop Kd (A/radps)."""
+        return self.set_float_param(PARAM_ATTITUDE_KD, value)
+
+    def get_attitude_iq_limit(self) -> float:
+        """Read attitude loop iq limit (A)."""
+        return self.get_float_param(PARAM_ATTITUDE_IQ_LIMIT)
+
+    def set_attitude_iq_limit(self, value: float) -> bool:
+        """Write attitude loop iq limit (A)."""
+        return self.set_float_param(PARAM_ATTITUDE_IQ_LIMIT, value)
+
+    def get_attitude_shutdown_rad(self) -> float:
+        """Read attitude shutdown threshold (rad)."""
+        return self.get_float_param(PARAM_ATTITUDE_SHUTDOWN_RAD)
+
+    def set_attitude_shutdown_rad(self, value: float) -> bool:
+        """Write attitude shutdown threshold (rad)."""
+        return self.set_float_param(PARAM_ATTITUDE_SHUTDOWN_RAD, value)
 
     def get_info(self) -> dict:
         """Send GET_DEVICE_INFO_REQ, return device info dict."""

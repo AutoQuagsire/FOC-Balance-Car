@@ -254,18 +254,31 @@ typedef struct {
 
 
 /* ============================================================
- * 电机控制模式
+ * 电机外环模式
  * ============================================================
  *
- * 描述当前 Motor 层接受什么类型的控制目标。
+ * 描述 Motor 层希望跟踪的上层目标。
+ * 这里保留开环速度，暂不保留开环位置，因为它和闭环位置的语义容易混淆。
  */
 typedef enum {
-    motor_control_torque = 0,        /**< 力矩控制，底层可对应电流控制或电压控制 */
-    motor_control_velocity,          /**< 闭环速度控制 */
-    motor_control_angle,             /**< 闭环位置/角度控制 */
-    motor_control_openloop_velocity, /**< 开环速度控制 */
-    motor_control_openloop_angle     /**< 开环角度控制 */
-} MotorControlMode_t;
+    motor_outer_torque=0,             /**< 力矩目标 */
+    motor_outer_velocity,           /**< 闭环速度目标 */
+    motor_outer_position,           /**< 闭环位置/角度目标 */
+    motor_outer_openloop_velocity   /**< 开环速度 */
+} MotorOuterLoopMode_t;
+
+
+/* ============================================================
+ * 电机内环模式
+ * ============================================================
+ *
+ * 描述 Motor 层内部输出采用的执行方式。
+ */
+typedef enum {
+    motor_inner_voltage=0,    /**< 电压模式 */
+    motor_inner_current     /**< 电流环模式 */
+} MotorInnerLoopMode_t;
+
 
 
 /* ============================================================
@@ -276,7 +289,8 @@ typedef enum {
  * 不属于电机物理参数。
  */
 typedef struct {
-    MotorControlMode_t control_mode; /**< 当前控制模式 */
+    MotorOuterLoopMode_t outer_loop; /**< 当前外环模式 */
+    MotorInnerLoopMode_t inner_loop; /**< 当前内环模式 */
     float voltage_limit;             /**< Motor 层允许输出的最大电压 */
     float voltage_sensor_align;      /**< 传感器对齐/零电角校准时使用的电压 */
 } MotorConfig_t;
@@ -417,7 +431,7 @@ void linkCurrentSense(CurrentSense_t *Current_Sense, Motor_t *motor);
  * 该函数不等价于零位电角度校准。
  * 调用后仍需要 Motor_CalibrateZeroElectricalAngle()。
  */
-uint8_t FOCMotor_init(Motor_t *FOC_Motor);
+uint8_t FOCMotor_ConfigureState(Motor_t *motor);
 
 
 /**

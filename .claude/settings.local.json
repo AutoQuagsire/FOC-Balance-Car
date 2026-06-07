@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(reg query *)",
-      "Read(//c/Users/Lenovo/.codex/**)"
+      "Read(//c/Users/Lenovo/.codex/**)",
+      "Bash(python -m py_compile debuglink_gui.py)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Lenovo\\Vodka\\dataengines\\firewater\\DATA"

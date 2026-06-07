@@ -37,7 +37,8 @@ _FLAG_TABLE = [
     (_FOC_FLAG_ATTITUDE_CONTROL_ON, "bal"),
 ]
 
-_STREAM_PAYLOAD_SIZE = 42
+_STREAM_PAYLOAD_SIZE_MIN = 42
+_STREAM_PAYLOAD_SIZE_WITH_RAW_SPEED = 44
 _FASTRING_STATUS_SIZE = 11
 _FASTRING_CHUNK_HEADER_SIZE = 12
 _FASTRING_SAMPLE_SIZE = 26
@@ -57,9 +58,9 @@ def source_to_label(v: int) -> str:
 
 
 def parse_status_stream(payload: bytes, host_rx_time_ms: int) -> LiveFrame:
-    if len(payload) < _STREAM_PAYLOAD_SIZE:
+    if len(payload) < _STREAM_PAYLOAD_SIZE_MIN:
         raise ValueError(
-            f"STATUS_STREAM payload too short: need {_STREAM_PAYLOAD_SIZE} bytes, got {len(payload)}"
+            f"STATUS_STREAM payload too short: need at least {_STREAM_PAYLOAD_SIZE_MIN} bytes, got {len(payload)}"
         )
 
     tick_ms = struct.unpack_from("<I", payload, 0)[0]
@@ -68,8 +69,8 @@ def parse_status_stream(payload: bytes, host_rx_time_ms: int) -> LiveFrame:
     speed_i_term_deg = struct.unpack_from("<h", payload, 8)[0] / 100.0
     pitch_meas_deg = struct.unpack_from("<h", payload, 10)[0] / 100.0
     pitch_rate_dps = struct.unpack_from("<h", payload, 12)[0] / 100.0
-    speed_target_radps = struct.unpack_from("<h", payload, 14)[0] / 1000.0
-    speed_meas_radps = struct.unpack_from("<h", payload, 16)[0] / 1000.0
+    speed_target_radps = struct.unpack_from("<h", payload, 14)[0] / 100.0
+    speed_meas_radps = struct.unpack_from("<h", payload, 16)[0] / 100.0
     attitude_p_iq_cmd_a = struct.unpack_from("<h", payload, 18)[0] / 1000.0
     attitude_d_iq_cmd_a = struct.unpack_from("<h", payload, 20)[0] / 1000.0
     iq_cmd_a = struct.unpack_from("<h", payload, 22)[0] / 1000.0
@@ -82,6 +83,10 @@ def parse_status_stream(payload: bytes, host_rx_time_ms: int) -> LiveFrame:
     uq_r_v = struct.unpack_from("<h", payload, 36)[0] / 1000.0
     bus_v = struct.unpack_from("<H", payload, 38)[0] / 1000.0
     fault_flags = struct.unpack_from("<H", payload, 40)[0]
+    if len(payload) >= _STREAM_PAYLOAD_SIZE_WITH_RAW_SPEED:
+        speed_raw_radps = struct.unpack_from("<h", payload, 42)[0] / 100.0
+    else:
+        speed_raw_radps = speed_meas_radps
 
     return LiveFrame(
         tick_ms=tick_ms,
@@ -92,6 +97,7 @@ def parse_status_stream(payload: bytes, host_rx_time_ms: int) -> LiveFrame:
         pitch_rate_dps=pitch_rate_dps,
         speed_target_radps=speed_target_radps,
         speed_meas_radps=speed_meas_radps,
+        speed_raw_radps=speed_raw_radps,
         attitude_p_iq_cmd_a=attitude_p_iq_cmd_a,
         attitude_d_iq_cmd_a=attitude_d_iq_cmd_a,
         iq_cmd_a=iq_cmd_a,

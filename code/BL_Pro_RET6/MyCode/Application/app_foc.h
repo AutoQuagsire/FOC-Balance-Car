@@ -79,8 +79,17 @@ float App_FOC_GetAverageWheelSpeedRadps(void);
 void App_FOC_GetTelemetry(App_FOCTelemetry_t *telemetry);
 uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable);
 uint8_t App_FOC_IsPowerStageEnabled(void);
+uint8_t App_FOC_SetDriverGateEnabled(uint8_t enable);
 void App_CurrentPID_SetSame(float kp, float ki, float kd, float integral_limit);
 void App_CurrentPID_GetSame(float *kp, float *ki, float *kd, float *integral_limit);
+uint8_t App_CurrentPID_SetMode(uint8_t mode);
+uint8_t App_CurrentPID_GetMode(void);
+uint8_t App_CurrentPID_SetOutputLimit(float output_limit);
+uint8_t App_CurrentPID_GetOutputLimit(float *output_limit);
+uint8_t App_CurrentPID_SetIErrMin(float i_err_min);
+uint8_t App_CurrentPID_GetIErrMin(float *i_err_min);
+uint8_t App_CurrentPID_SetISepRatio(float i_sep_ratio);
+uint8_t App_CurrentPID_GetISepRatio(float *i_sep_ratio);
 
 extern volatile uint8_t g_current_pid_mode; /* 0=CurrentLoop_FFPI_V1, 1=Pure PI compare */
 

@@ -44,6 +44,6 @@ AS5047P_Status_t AS5047P_ReadRawAngle(AS5047P_Handle_t *dev, uint16_t *raw);
 AS5047P_Status_t AS5047P_ReadMagnitude(AS5047P_Handle_t *dev, uint16_t *mag);
 AS5047P_Status_t AS5047P_ReadErrfl(AS5047P_Handle_t *dev, uint16_t *errfl);
 AS5047P_Status_t AS5047P_ClearErrorFlag(AS5047P_Handle_t *dev);
-float normalizeAngle(float angle);
+
 
 #endif

@@ -57,13 +57,10 @@ void Driver_Disable(Driver_t *driver);
 void Driver_Enable(Driver_t *driver);
 /* Driver initialization and accessor */
 uint8_t Driver_Init(Driver_t *driver, TIM_HandleTypeDef *htim,
-                 uint32_t chA, uint32_t chB, uint32_t chC,
-                 float voltage_limit);
-void Driver_LinkHardware(Driver_t *driver, TIM_HandleTypeDef *htim,
-                         uint32_t chA, uint32_t chB, uint32_t chC,
-                         GPIO_TypeDef *en_port, uint16_t en_pin,
-                         uint8_t enable_active_low,
-                         float voltage_limit);
+                    uint32_t chA, uint32_t chB, uint32_t chC,
+                    GPIO_TypeDef *en_port, uint16_t en_pin,
+                    uint8_t enable_active_low,
+                    float voltage_limit);
 Driver_t* Driver_GetInstance(DriverSide_t side);
 
 

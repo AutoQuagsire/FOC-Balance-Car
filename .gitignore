@@ -1,0 +1,13 @@
+.idea/
+code/BL_Pro_RET6/.venv-gui-pack39/
+code/BL_Pro_RET6/dist/
+code/BL_Pro_RET6/dist_nuitka/
+code/BL_Pro_RET6/tools/__pycache__/
+code/BL_Pro_RET6/current_loop_data/*.csv
+code/BL_Pro_RET6/stream_data/
+code/BL_Pro_RET6/DebugLinkGUI.spec
+code/BL_Pro_RET6/tools/DebugLinkGUI.dist/
+code/BL_Pro_RET6/tools/pysidedeploy.spec
+code/dist_nuitka.zip
+left.csv
+right.csv
