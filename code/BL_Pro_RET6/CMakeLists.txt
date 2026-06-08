@@ -49,6 +49,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     MyCode/System/usb_debug.c
     MyCode/System/debug_link_protocol.c
     MyCode/System/debug_link_app_adapter.c
+    MyCode/System/debug_link_app_codec.c
     MyCode/System/debug_link.c
     MyCode/System/sys.c
     MyCode/System/INT.c
@@ -62,6 +63,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     MyCode/SimpleFOC_Learning/BusVoltage.c
 
     MyCode/Application/app_foc.c
+    MyCode/Application/app_foc_bus.c
+    MyCode/Application/app_foc_debug.c
+    MyCode/Application/app_foc_test.c
     MyCode/Application/app_attitude.c
     MyCode/Algorithm/PID.c
     MyCode/Algorithm/Filter.c

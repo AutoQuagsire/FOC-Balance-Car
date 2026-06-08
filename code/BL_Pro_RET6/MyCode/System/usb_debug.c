@@ -10,6 +10,7 @@
 #include "main.h"
 #include "PID.h"
 #include "app_foc.h"
+#include "app_foc_debug.h"
 #include "INT.h"
 
 #include <stdio.h>
@@ -245,9 +246,11 @@ static void handle_one_command(const char *cmd)
 
     if (strncmp(cmd, "PID MODE", 8) == 0)
     {
-        g_current_pid_mode = (g_current_pid_mode == 0U) ? 1U : 0U;
+        uint8_t next_mode = (App_CurrentPID_GetMode() == 0U) ? 1U : 0U;
+
+        (void)App_CurrentPID_SetMode(next_mode);
         USB_Debug_Printf("# Current PID mode switched to: %s\r\n",
-                         (g_current_pid_mode == 0U) ? "CurrentLoop_FFPI_V1" : "Pure PI compare");
+                         (App_CurrentPID_GetMode() == 0U) ? "CurrentLoop_FFPI_V1" : "Pure PI compare");
         return;
     }
 
@@ -279,7 +282,7 @@ static void handle_one_command(const char *cmd)
                          TUNE_SIDE_NAME,
                          cur_kp, cur_ki, cur_kd,
                          cur_ilim,
-                         (unsigned)(g_current_pid_mode == 0U),
+                         (unsigned)(App_CurrentPID_GetMode() == 0U),
                          sched_ff,
                          sched_ilim,
                          TUNE_TARGET);

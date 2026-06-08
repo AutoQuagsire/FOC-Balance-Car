@@ -27,6 +27,8 @@
 #include "sensor.h"
 #include "BLDCMotor.h"
 #include "app_foc.h"
+#include "app_foc_bus.h"
+#include "app_foc_debug.h"
 #include "app_attitude.h"
 #include "usb_debug.h"
 #include "icm42688p.h"

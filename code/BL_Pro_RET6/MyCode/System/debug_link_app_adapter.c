@@ -2,6 +2,7 @@
 
 #include "app_attitude.h"
 #include "app_foc.h"
+#include "app_foc_debug.h"
 
 #include <string.h>
 

@@ -1,4 +1,7 @@
 #include "app_foc.h"
+#include "app_foc_bus.h"
+#include "app_foc_debug.h"
+#include "app_foc_internal.h"
 #include "foc_common.h"
 #include "Filter.h"
 #include "current_sense.h"
@@ -24,17 +27,13 @@
 
 
 
-static uint8_t App_InitBusVoltage(void);
 static uint8_t App_InitMotor1Stack(void);
 static uint8_t App_InitMotor2Stack(void);
 static uint8_t App_InitFOCAlgorithm(void);
 static void App_FOC_ForcePowerStageOff(void);
-static int16_t app_fastlog_scale_to_i16(float value, float scale);
 
-static volatile uint8_t g_foc_stack_ready = 0U;
-static volatile uint8_t g_bus_telemetry_ready = 0U;
-static volatile uint8_t g_foc_power_stage_enabled = 0U;
-static uint32_t         g_last_bus_voltage_sample_tick_ms = 0U;
+volatile uint8_t g_foc_stack_ready = 0U;
+volatile uint8_t g_foc_power_stage_enabled = 0U;
 
 /* FOC timing state shared by the SimpleFOC compatibility layer. */
 FocFrequency_t g_foc = {
@@ -60,9 +59,8 @@ FocFrequency_t g_foc = {
 uint8_t App_FOCStack_Init(void)
 {
     g_foc_stack_ready = 0U;
-    g_bus_telemetry_ready = 0U;
 
-    if(!App_InitBusVoltage()) {
+    if(!App_FOC_BusInit()) {
         USB_Debug_Printf("Bus voltage init failed\r\n");
         return 0U;
     }
@@ -83,8 +81,6 @@ uint8_t App_FOCStack_Init(void)
     App_FOC_ForcePowerStageOff();
     App_ResetFastRing();
     g_foc_stack_ready = 1U;
-    g_last_bus_voltage_sample_tick_ms = HAL_GetTick();
-    g_bus_telemetry_ready = 1U;
     USB_Debug_Printf("FOC stack init ok\r\n");
     return 1U;
 }
@@ -107,111 +103,48 @@ extern TIM_HandleTypeDef htim4;
  * 所以统一放在 app_foc.c 内部静态保存
  */
 
-static BusVoltage_t g_bus_voltage;
-static volatile BusVoltageDebug_t g_bus_voltage_debug;
-static LowPassFilter_t g_bus_voltage_lpf;   //母线电压的低通滤波器
-static float g_bus_voltage_filtered = 0.0f;
-static uint8_t g_bus_voltage_valid = 0U;
-
-static Motor_t          g_motor1;   // 电机控制对象
-static Driver_t        *g_driver1 = NULL; // 三相驱动对象（由 Driver 模块提供实例）
+Motor_t                 g_motor1;   // 电机控制对象
+Driver_t               *g_driver1 = NULL; // 三相驱动对象（由 Driver 模块提供实例）
 static AS5047P_Handle_t g_enc1;     // AS5047P 底层驱动句柄
-static Sensor_t         g_sensor1;  // 传感器公共层对象
-static CurrentSense_t  g_current_sense1; // 电流采样对象
+Sensor_t                g_sensor1;  // 传感器公共层对象
+CurrentSense_t          g_current_sense1; // 电流采样对象
 static PID_t            g_speed_pid1;
 LowPassFilter_t         g_speed_lpf1;
-static PID_t            g_current_pid1;
-static PID_t            g_current_pid1_Common;
+PID_t                   g_current_pid1;
+PID_t                   g_current_pid1_Common;
 LowPassFilter_t         g_current_lpf1;
 
 
-static Motor_t          g_motor2;   // 电机控制对象
-static Driver_t        *g_driver2 = NULL; // 三相驱动对象（由 Driver 模块提供实例）
+Motor_t                 g_motor2;   // 电机控制对象
+Driver_t               *g_driver2 = NULL; // 三相驱动对象（由 Driver 模块提供实例）
 static AS5047P_Handle_t g_enc2;     // AS5047P 底层驱动句柄
-static Sensor_t         g_sensor2;  // 传感器公共层对象
-static CurrentSense_t  g_current_sense2; // 电流采样对象
+Sensor_t                g_sensor2;  // 传感器公共层对象
+CurrentSense_t          g_current_sense2; // 电流采样对象
 static PID_t            g_speed_pid2;
 LowPassFilter_t         g_speed_lpf2;
-static PID_t            g_current_pid2;
-static PID_t            g_current_pid2_Common;
+PID_t                   g_current_pid2;
+PID_t                   g_current_pid2_Common;
 LowPassFilter_t         g_current_lpf2;
 
 
 static uint32_t         g_last_loop_tick_ms = 0U;
 static uint32_t         g_last_print_tick_ms = 0U;
 static uint32_t         g_last_while_debug_tick_ms = 0U;
-static volatile CurrentLoopDebugSnapshot_t g_current_loop_debug1;
-static volatile CurrentLoopDebugSnapshot_t g_current_loop_debug2;
-static volatile uint8_t g_foc_control_it_enabled = 0U;
-static volatile uint32_t g_foc_loop_count = 0U;
-static volatile uint32_t g_foc_last_loop_tick_ms = 0U;
-static uint8_t g_current_i_unload_limit_ticks1 = 0U;
-static uint8_t g_current_i_unload_limit_ticks2 = 0U;
-static float g_current_iq_ref1 = 0.0f;
-static float g_current_iq_ref2 = 0.0f;
-static uint32_t g_last_current_debug_print_ms = 0U;
-
-#if APP_BUS_VOLTAGE_ENABLE
-static uint8_t App_BusVoltageStartupSample(void);
-#endif
-
-#define APP_BUS_VOLTAGE_SAMPLE_PERIOD_MS (10U)
-#define APP_BUS_VOLTAGE_LPF_CUTOFF_HZ (10.0f)
-#define APP_BUS_VOLTAGE_STARTUP_SAMPLE_COUNT (20U)
-#define APP_BUS_VOLTAGE_VALID_MIN_V (5.0f)
-#define APP_BUS_VOLTAGE_VALID_MAX_V (30.0f)
-
-
-
-
-
-static void App_ServiceBusVoltageSample(void)
-{
-#if APP_BUS_VOLTAGE_ENABLE
-    if (!BusVoltage_SampleOnce(&g_bus_voltage)) {
-        g_bus_voltage_valid = 0U;
-        return;
-    }
-
-    g_bus_voltage_debug.bus_voltage = BusVoltage_GetBusVoltage(&g_bus_voltage);
-    g_bus_voltage_debug.adc_pin_voltage = BusVoltage_GetAdcPinVoltage(&g_bus_voltage);
-    g_bus_voltage_debug.raw_adc = BusVoltage_GetRawAdc(&g_bus_voltage);
-
-    if ((g_bus_voltage_debug.bus_voltage < APP_BUS_VOLTAGE_VALID_MIN_V) ||
-        (g_bus_voltage_debug.bus_voltage > APP_BUS_VOLTAGE_VALID_MAX_V)) {
-        g_bus_voltage_valid = 0U;
-        return;
-    }
-
-    g_bus_voltage_valid = 1U;
-    g_bus_voltage_filtered = LowPassFilter_Update(&g_bus_voltage_lpf,
-                                                  g_bus_voltage_debug.bus_voltage);
-
-#if APP_BUS_VOLTAGE_FOC_ENABLE
-    /* 使用滤波后的母线电压参与 FOC 调制，原始值保留用于调试对比。 */
-    if (g_driver1 != NULL) {
-        g_driver1->supply_voltage = g_bus_voltage_filtered;
-    }
-    if (g_driver2 != NULL) {
-        g_driver2->supply_voltage = g_bus_voltage_filtered;
-    }
-#endif
-#else
-    g_bus_voltage_valid = 1U;
-    g_bus_voltage_debug.raw_adc = 0U;
-    g_bus_voltage_debug.adc_pin_voltage = 0.0f;
-    g_bus_voltage_debug.bus_voltage = V_SUPPLY;
-    g_bus_voltage_filtered = V_SUPPLY;
-#endif
-}
-
-
+volatile CurrentLoopDebugSnapshot_t g_current_loop_debug1;
+volatile CurrentLoopDebugSnapshot_t g_current_loop_debug2;
+volatile uint8_t g_foc_control_it_enabled = 0U;
+volatile uint32_t g_foc_loop_count = 0U;
+volatile uint32_t g_foc_last_loop_tick_ms = 0U;
+uint8_t g_current_i_unload_limit_ticks1 = 0U;
+uint8_t g_current_i_unload_limit_ticks2 = 0U;
+float g_current_iq_ref1 = 0.0f;
+float g_current_iq_ref2 = 0.0f;
 
 PID_t Left_Velocity_FOC_PID;
 static float g_speed_target_radps = 0.3f;
 volatile uint8_t g_current_pid_mode = 0U; /* 0=CurrentLoop_FFPI_V1, 1=Pure PI compare */
-static volatile float g_current_i_sep_ratio_ff = CURRENT_LOOP_I_SEP_RATIO;
-static volatile float g_current_i_sep_ratio_pure = CURRENT_LOOP_PURE_PI_I_SEP_RATIO;
+volatile float g_current_i_sep_ratio_ff = CURRENT_LOOP_I_SEP_RATIO;
+volatile float g_current_i_sep_ratio_pure = CURRENT_LOOP_PURE_PI_I_SEP_RATIO;
 
 float g_speed_fault2 = 0.0f;
 float g_speed_fault1 = 0.0f;
@@ -222,7 +155,6 @@ float g_speed_fault1 = 0.0f;
 #define APP_LOOP_TEST_UQ_V        (1.0f)
 #define APP_LOOP_PRINT_PERIOD_MS  (100U)
 
-#define APP_SPEED_LOOP_ENABLE      (1U)
 #define APP_SPEED_TARGET_RAD_S     (10.0f)
 #define APP_SPEED_KP               (0.055f)
 #define APP_SPEED_KI               (0.00035f)
@@ -234,7 +166,6 @@ float g_speed_fault1 = 0.0f;
 #define APP_SPEED_VEL_FAULT_ABS    (80.0f)
 
 
-#define APP_CURRENT_LOOP_ENABLE      (1U)
 #define APP_CURRENT_TARGET_A       (0.3f)
 #define APP_CURRENT_KP             (2.5)
 #define APP_CURRENT_KI             (0.2f)
@@ -243,40 +174,18 @@ float g_speed_fault1 = 0.0f;
 #define APP_LEFT_WHEEL_SPEED_SIGN   (1.0f)
 #define APP_RIGHT_WHEEL_SPEED_SIGN  (-1.0f)
 
-static volatile float g_iq_target_left = APP_CURRENT_TARGET_A;
-static volatile float g_iq_target_right = APP_CURRENT_TARGET_A;
+volatile float g_iq_target_left = APP_CURRENT_TARGET_A;
+volatile float g_iq_target_right = APP_CURRENT_TARGET_A;
 
 extern float vel_windowed_f1;
 extern float vel_windowed_f2;
 
-#define APP_CURRENT_I_LIMIT          (5.0f)
 #define APP_CURRENT_PURE_PI_I_LIMIT  (6.0f)
-#define APP_CURRENT_I_ERR_MIN        (0.05f)
-
 
 #define APP_CURRENT_FF_KP             (2.8f)
 #define APP_CURRENT_FF_KI             (0.35f)
 #define APP_CURRENT_FF_KD             (0.0f)
 #define APP_CURRENT_FF_I_LIMIT          (5.0f)
-
-
-#define APP_CURRENT_I_ERR_MIN        (0.05f)
-#define APP_CURRENT_OUT_LIMIT       (10.963f)
-#define APP_CURRENT_DEBUG_PRINT_PERIOD_MS (100U)
-
-#define APP_CS_SIGN_TEST_UQ_V         (0.8f)
-#define APP_CS_SIGN_TEST_SETTLE_MS    (80U)
-#define APP_CS_SIGN_TEST_SAMPLE_CNT   (120U)
-#define APP_CS_SIGN_TEST_SAMPLE_DT_MS (1U)
-#define APP_CS_SIGN_TEST_DEADBAND_A   (0.03f)
-
-#define APP_SENSOR_DIR_TEST_UQ_V         (4.0f)
-#define APP_SENSOR_DIR_TEST_SETTLE_MS    (500U)
-#define APP_SENSOR_DIR_TEST_ELEC_STEP    (PI * 0.5f)
-#define APP_SENSOR_DIR_TEST_DEADBAND_RAD (0.02f)
-#define APP_SENSOR_DIR_TEST_MAX_STEP_MS  (2500U)
-
-
 
 #define APP_MOVE_DOWNSAMPLE        (1U)
 
@@ -286,30 +195,9 @@ extern float vel_windowed_f2;
 #endif
 
 /* 重置 PID 运行状态：只清积分、上次误差和输出，不改 PID 参数 */
-static void App_PIDResetRuntime(PID_t *pid)
+void App_PIDResetRuntime(PID_t *pid)
 {
     PID_Reset(pid);
-}
-
-
-/* 清空电流环调试快照，避免打印到上一次残留数据 */
-static void App_CurrentLoopDebugClear(volatile CurrentLoopDebugSnapshot_t *debug)
-{
-    if (debug == NULL) {
-        return;
-    }
-
-    debug->target_iq = 0.0f;
-    debug->iq_ref = 0.0f;
-    debug->filtered_iq = 0.0f;
-    debug->raw_iq = 0.0f;
-    debug->error = 0.0f;
-    debug->pi_out = 0.0f;
-    debug->ff_term = 0.0f;
-    debug->uq_final = 0.0f;
-    debug->ff_coef = 0.0f;
-    debug->integral_limit = 0.0f;
-    debug->pid_integral = 0.0f;
 }
 
 
@@ -349,6 +237,8 @@ static uint8_t App_CurrentLoopIsTargetMagnitudeFalling(float target_iq, float pr
     return (uint8_t)((same_positive || same_negative) &&
                      ((target_abs + eps) < prev_abs));
 }
+
+
 
 
 /* 电流环核心计算：
@@ -468,318 +358,6 @@ static float App_CurrentLoopComputeUq(Motor_t *motor,
 }
 
 
-/* 周期性打印电流环调试信息。
- * 先关中断复制快照，再打印，避免打印过程中 ISR 正在改数据。
- */
-static void App_PrintCurrentLoopDebugIfDue(void)
-{
-    CurrentLoopDebugSnapshot_t left_debug;
-    uint32_t now_ms = HAL_GetTick();
-
-    if ((now_ms - g_last_current_debug_print_ms) < APP_CURRENT_DEBUG_PRINT_PERIOD_MS) {
-        return;
-    }
-    g_last_current_debug_print_ms = now_ms;
-
-    __disable_irq();
-    left_debug = g_current_loop_debug1;
-    __enable_irq();
-
-#if LEFT_MOTOR_ENABLE
-    USB_Debug_Printf("[CL][L] %.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\r\n",
-                     left_debug.target_iq,
-                     left_debug.iq_ref,
-                     left_debug.filtered_iq,
-                     left_debug.raw_iq,
-                     left_debug.error,
-                     left_debug.pi_out,
-                     left_debug.ff_term,
-                     left_debug.uq_final,
-                     left_debug.ff_coef,
-                     left_debug.integral_limit,
-                     left_debug.pid_integral);
-    USB_Debug_Printf("[BUS] %u,%.4f,%.4f\r\n",
-                     (unsigned)g_bus_voltage_debug.raw_adc,
-                     g_bus_voltage_debug.adc_pin_voltage,
-                     g_bus_voltage_debug.bus_voltage);
-#endif
-}
-
-
-
-/* 应用一组电流环 PID 参数，并保留原有输出限幅/积分分离下限等配置 */
-static void App_CurrentPIDApplyOne(PID_t *pid, float kp, float ki, float kd, float integral_limit)
-{
-    float output_limit;
-    float i_err_min;
-    float i_sep_ratio;
-
-    if (pid == NULL) {
-        return;
-    }
-
-    output_limit = (pid->output_limit > 0.0f) ? pid->output_limit : APP_CURRENT_OUT_LIMIT;
-    i_err_min = (pid->I_ERR_MIN > 0.0f) ? pid->I_ERR_MIN : APP_CURRENT_I_ERR_MIN;
-    i_sep_ratio = (pid->I_SEP_RATIO > 0.0f) ? pid->I_SEP_RATIO : g_current_i_sep_ratio_ff;
-
-    PID_ParameterInitEx(pid, kp, ki, kd, integral_limit,
-                        output_limit, i_err_min, i_sep_ratio);
-
-    App_PIDResetRuntime(pid);
-}
-
-static void App_CurrentPIDSelectPairByMode(uint8_t mode, PID_t **pid1, PID_t **pid2)
-{
-    if ((pid1 == NULL) || (pid2 == NULL)) {
-        return;
-    }
-
-    if (mode == 0U) {
-        *pid1 = &g_current_pid1;
-        *pid2 = &g_current_pid2;
-    } else {
-        *pid1 = &g_current_pid1_Common;
-        *pid2 = &g_current_pid2_Common;
-    }
-}
-
-static void App_CurrentPIDReinitOneWithExisting(PID_t *pid,
-                                                float output_limit,
-                                                float i_err_min,
-                                                float i_sep_ratio)
-{
-    if (pid == NULL) {
-        return;
-    }
-    PID_ParameterInitEx(pid,
-                        pid->Kp,
-                        pid->Ki,
-                        pid->Kd,
-                        pid->integral_limit,
-                        output_limit,
-                        i_err_min,
-                        i_sep_ratio);
-    App_PIDResetRuntime(pid);
-}
-
-
-/* 同时设置左右电机电流环 PID。
- * g_current_pid_mode = 0：前馈 PI 参数组；
- * g_current_pid_mode != 0：纯 PI 对照参数组。
- */
-void App_CurrentPID_SetSame(float kp, float ki, float kd, float integral_limit)
-{
-    PID_t *pid1, *pid2;
-
-    if (integral_limit <= 0.0f) {
-        integral_limit = APP_CURRENT_I_LIMIT;
-    }
-
-    App_CurrentPIDSelectPairByMode(g_current_pid_mode, &pid1, &pid2);
-
-    __disable_irq();
-    App_CurrentPIDApplyOne(pid1, kp, ki, kd, integral_limit);
-    App_CurrentPIDApplyOne(pid2, kp, ki, kd, integral_limit);
-    __enable_irq();
-}
-
-
-/* 读取当前电流环 PID 参数，默认以左电机参数作为代表 */
-void App_CurrentPID_GetSame(float *kp, float *ki, float *kd, float *integral_limit)
-{
-    float local_kp;
-    float local_ki;
-    float local_kd;
-    float local_ilim;
-    PID_t *pid;
-
-    if (g_current_pid_mode == 0U) {
-        pid = &g_current_pid1;
-    } else {
-        pid = &g_current_pid1_Common;
-    }
-
-    __disable_irq();
-    local_kp = pid->Kp;
-    local_ki = pid->Ki;
-    local_kd = pid->Kd;
-    local_ilim = pid->integral_limit;
-    __enable_irq();
-
-    if (local_ilim <= 0.0f) {
-        local_ilim = APP_CURRENT_I_LIMIT;
-    }
-
-    if (kp != NULL) {
-        *kp = local_kp;
-    }
-    if (ki != NULL) {
-        *ki = local_ki;
-    }
-    if (kd != NULL) {
-        *kd = local_kd;
-    }
-    if (integral_limit != NULL) {
-        *integral_limit = local_ilim;
-    }
-}
-
-
-/* 重置所有电流环运行状态。
- * 注意：这里也会重置 iq_ref，因此目标电流改变后不会沿用旧斜坡状态。
- */
-uint8_t App_CurrentPID_SetMode(uint8_t mode)
-{
-    if (mode > 1U) {
-        return 0U;
-    }
-    __disable_irq();
-    g_current_pid_mode = mode;
-    __enable_irq();
-    App_ResetCurrentPIDs();
-    return 1U;
-}
-
-uint8_t App_CurrentPID_GetMode(void)
-{
-    return g_current_pid_mode;
-}
-
-uint8_t App_CurrentPID_SetOutputLimit(float output_limit)
-{
-    PID_t *pid1;
-    PID_t *pid2;
-
-    if ((!isfinite(output_limit)) || (output_limit <= 0.0f)) {
-        return 0U;
-    }
-
-    __disable_irq();
-    App_CurrentPIDSelectPairByMode(g_current_pid_mode, &pid1, &pid2);
-    App_CurrentPIDReinitOneWithExisting(pid1, output_limit, pid1->I_ERR_MIN, pid1->I_SEP_RATIO);
-    App_CurrentPIDReinitOneWithExisting(pid2, output_limit, pid2->I_ERR_MIN, pid2->I_SEP_RATIO);
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_CurrentPID_GetOutputLimit(float *output_limit)
-{
-    PID_t *pid;
-    float value;
-
-    if (output_limit == NULL) {
-        return 0U;
-    }
-
-    if (g_current_pid_mode == 0U) {
-        pid = &g_current_pid1;
-    } else {
-        pid = &g_current_pid1_Common;
-    }
-
-    __disable_irq();
-    value = pid->output_limit;
-    __enable_irq();
-    *output_limit = value;
-    return 1U;
-}
-
-uint8_t App_CurrentPID_SetIErrMin(float i_err_min)
-{
-    PID_t *pid1;
-    PID_t *pid2;
-
-    if ((!isfinite(i_err_min)) || (i_err_min <= 0.0f)) {
-        return 0U;
-    }
-
-    __disable_irq();
-    App_CurrentPIDSelectPairByMode(g_current_pid_mode, &pid1, &pid2);
-    App_CurrentPIDReinitOneWithExisting(pid1, pid1->output_limit, i_err_min, pid1->I_SEP_RATIO);
-    App_CurrentPIDReinitOneWithExisting(pid2, pid2->output_limit, i_err_min, pid2->I_SEP_RATIO);
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_CurrentPID_GetIErrMin(float *i_err_min)
-{
-    PID_t *pid;
-    float value;
-
-    if (i_err_min == NULL) {
-        return 0U;
-    }
-
-    if (g_current_pid_mode == 0U) {
-        pid = &g_current_pid1;
-    } else {
-        pid = &g_current_pid1_Common;
-    }
-
-    __disable_irq();
-    value = pid->I_ERR_MIN;
-    __enable_irq();
-    *i_err_min = value;
-    return 1U;
-}
-
-uint8_t App_CurrentPID_SetISepRatio(float i_sep_ratio)
-{
-    PID_t *pid1;
-    PID_t *pid2;
-
-    if ((!isfinite(i_sep_ratio)) || (i_sep_ratio <= 0.0f) || (i_sep_ratio > 1.0f)) {
-        return 0U;
-    }
-
-    __disable_irq();
-    if (g_current_pid_mode == 0U) {
-        g_current_i_sep_ratio_ff = i_sep_ratio;
-    } else {
-        g_current_i_sep_ratio_pure = i_sep_ratio;
-    }
-    App_CurrentPIDSelectPairByMode(g_current_pid_mode, &pid1, &pid2);
-    App_CurrentPIDReinitOneWithExisting(pid1, pid1->output_limit, pid1->I_ERR_MIN, i_sep_ratio);
-    App_CurrentPIDReinitOneWithExisting(pid2, pid2->output_limit, pid2->I_ERR_MIN, i_sep_ratio);
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_CurrentPID_GetISepRatio(float *i_sep_ratio)
-{
-    if (i_sep_ratio == NULL) {
-        return 0U;
-    }
-    __disable_irq();
-    if (g_current_pid_mode == 0U) {
-        *i_sep_ratio = g_current_i_sep_ratio_ff;
-    } else {
-        *i_sep_ratio = g_current_i_sep_ratio_pure;
-    }
-    __enable_irq();
-    return 1U;
-}
-
-void App_ResetCurrentPIDs(void)
-{
-    __disable_irq();
-
-    App_PIDResetRuntime(&g_current_pid1);
-    App_PIDResetRuntime(&g_current_pid2);
-    App_PIDResetRuntime(&g_current_pid1_Common);
-    App_PIDResetRuntime(&g_current_pid2_Common);
-
-    App_CurrentLoopDebugClear(&g_current_loop_debug1);
-    App_CurrentLoopDebugClear(&g_current_loop_debug2);
-
-    g_current_i_unload_limit_ticks1 = 0U;
-    g_current_i_unload_limit_ticks2 = 0U;
-
-    g_current_iq_ref1 = g_iq_target_left;
-    g_current_iq_ref2 = g_iq_target_right;
-
-    __enable_irq();
-}
 
 void App_FOC_SetIqTarget(float left_iq, float right_iq)
 {
@@ -788,6 +366,8 @@ void App_FOC_SetIqTarget(float left_iq, float right_iq)
     g_iq_target_right = right_iq;
     __enable_irq();
 }
+
+
 
 float App_FOC_GetAverageWheelSpeedRadps(void)
 {
@@ -802,132 +382,6 @@ float App_FOC_GetAverageWheelSpeedRadps(void)
     return 0.5f * ((APP_LEFT_WHEEL_SPEED_SIGN * left_speed) +
                    (APP_RIGHT_WHEEL_SPEED_SIGN * right_speed));
 }
-
-float App_FOC_GetBusVoltageFiltered(void)
-{
-    return g_bus_voltage_filtered;
-}
-
-uint8_t App_FOC_BusTelemetryInit(void)
-{
-    if (g_foc_stack_ready != 0U) {
-        g_last_bus_voltage_sample_tick_ms = HAL_GetTick();
-        g_bus_telemetry_ready = 1U;
-        return 1U;
-    }
-
-    g_bus_telemetry_ready = 0U;
-
-    if (!App_InitBusVoltage()) {
-        return 0U;
-    }
-
-    g_last_bus_voltage_sample_tick_ms = HAL_GetTick();
-    g_bus_telemetry_ready = 1U;
-    return 1U;
-}
-
-void App_FOC_BusTelemetryService(void)
-{
-    uint32_t now_ms;
-
-    if (g_bus_telemetry_ready == 0U) {
-        return;
-    }
-
-    now_ms = HAL_GetTick();
-#if APP_BUS_VOLTAGE_ENABLE
-    if ((now_ms - g_last_bus_voltage_sample_tick_ms) >= APP_BUS_VOLTAGE_SAMPLE_PERIOD_MS) {
-        g_last_bus_voltage_sample_tick_ms = now_ms;
-        App_ServiceBusVoltageSample();
-    }
-#endif
-}
-
-void App_FOC_GetTelemetry(App_FOCTelemetry_t *telemetry)
-{
-    App_FOCTelemetry_t snapshot;
-    uint8_t bus_valid;
-    uint8_t stack_ready;
-    uint8_t control_it_enabled;
-    uint32_t loop_count;
-    uint32_t last_loop_tick_ms;
-    float speed_fault_left;
-    float speed_fault_right;
-    uint16_t flags = 0U;
-    uint32_t now_ms;
-
-    if (telemetry == NULL) {
-        return;
-    }
-
-    snapshot.wheel_vel_left_radps = 0.0f;
-    snapshot.wheel_vel_right_radps = 0.0f;
-    snapshot.filtered_iq_left_a = 0.0f;
-    snapshot.filtered_iq_right_a = 0.0f;
-    snapshot.uq_left_v = 0.0f;
-    snapshot.uq_right_v = 0.0f;
-    snapshot.bus_voltage_v = 0.0f;
-    snapshot.status_flags = 0U;
-
-    __disable_irq();
-    snapshot.wheel_vel_left_radps = vel_windowed_f1;
-    snapshot.wheel_vel_right_radps = vel_windowed_f2;
-    snapshot.filtered_iq_left_a = g_current_loop_debug1.filtered_iq;
-    snapshot.filtered_iq_right_a = g_current_loop_debug2.filtered_iq;
-    snapshot.uq_left_v = g_current_loop_debug1.uq_final;
-    snapshot.uq_right_v = g_current_loop_debug2.uq_final;
-    snapshot.bus_voltage_v = g_bus_voltage_filtered;
-    bus_valid = g_bus_voltage_valid;
-    stack_ready = g_foc_stack_ready;
-    control_it_enabled = g_foc_control_it_enabled;
-    loop_count = g_foc_loop_count;
-    last_loop_tick_ms = g_foc_last_loop_tick_ms;
-    speed_fault_left = g_speed_fault1;
-    speed_fault_right = g_speed_fault2;
-    __enable_irq();
-
-    now_ms = HAL_GetTick();
-
-    if (speed_fault_left > 0.5f) {
-        flags |= APP_FOC_STATUS_FLAG_SPEED_FAULT_L;
-    }
-    if (speed_fault_right > 0.5f) {
-        flags |= APP_FOC_STATUS_FLAG_SPEED_FAULT_R;
-    }
-    if (stack_ready != 0U) {
-        flags |= APP_FOC_STATUS_FLAG_STACK_READY;
-    }
-    if (control_it_enabled != 0U) {
-        flags |= APP_FOC_STATUS_FLAG_CONTROL_IT_ENABLED;
-    }
-    if (bus_valid != 0U) {
-        flags |= APP_FOC_STATUS_FLAG_BUS_VALID;
-    }
-    if ((loop_count > 0U) && ((now_ms - last_loop_tick_ms) <= 100U)) {
-        flags |= APP_FOC_STATUS_FLAG_CURRENT_LOOP_ACTIVE;
-    }
-#if APP_SPEED_LOOP_ENABLE
-    flags |= APP_FOC_STATUS_FLAG_SPEED_LOOP_ENABLED;
-#endif
-#if APP_CURRENT_LOOP_ENABLE
-    flags |= APP_FOC_STATUS_FLAG_CURRENT_LOOP_ENABLED;
-#endif
-    if (g_foc_power_stage_enabled == 0U) {
-        flags |= APP_FOC_STATUS_FLAG_POWER_STAGE_OFF;
-    }
-    if (App_Attitude_IsControlEnabled() != 0U) {
-        flags |= APP_FOC_STATUS_FLAG_ATTITUDE_CONTROL_ON;
-    }
-
-    snapshot.status_flags = flags;
-    *telemetry = snapshot;
-}
-
-
-
-
-
 
 /* 上电零位电角度校准。
  * 当前左右电机均使用 q 轴固定矢量吸附转子，再反算 zero_electrical_angle。
@@ -953,296 +407,6 @@ uint8_t App_StartupCalibrate(void)
 #endif
 
     return 1U;
-}
-
-
-/* 带死区的符号判断，用于电流采样正负号测试 */
-static int8_t app_sign_with_deadband(float v, float deadband)
-{
-    if (v > deadband) {
-        return 1;
-    }
-    if (v < -deadband) {
-        return -1;
-    }
-    return 0;
-}
-
-
-/* 在指定电角度施加 uq，并对 ia/ib 多次采样取平均。
- * 用于判断电流采样方向是否正确。
- */
-static PhaseCurrent_t app_measure_phase_current_avg(Motor_t *motor,
-                                                    CurrentSense_t *cs,
-                                                    float uq,
-                                                    float elec_angle)
-{
-    uint32_t i;
-    PhaseCurrent_t avg = {0.0f, 0.0f};
-
-    if ((motor == NULL) || (cs == NULL)) {
-        return avg;
-    }
-
-    Motor_SetPhaseVoltageQ(motor, uq, elec_angle);
-    HAL_Delay(APP_CS_SIGN_TEST_SETTLE_MS);
-
-    for (i = 0U; i < APP_CS_SIGN_TEST_SAMPLE_CNT; i++) {
-        PhaseCurrent_t cur = CurrentSense_GetPhaseCurrent(cs);
-        avg.ia += cur.ia;
-        avg.ib += cur.ib;
-        HAL_Delay(APP_CS_SIGN_TEST_SAMPLE_DT_MS);
-    }
-
-    avg.ia /= (float)APP_CS_SIGN_TEST_SAMPLE_CNT;
-    avg.ib /= (float)APP_CS_SIGN_TEST_SAMPLE_CNT;
-
-    return avg;
-}
-
-
-/* 单电机电流采样符号测试。
- * 根据 0、π、π/2、3π/2 四个电角度下 ia/ib 的符号，
- * 判断 A_SIGN / B_SIGN 是否需要翻转。
- */
-static void app_current_sense_sign_test_one(const char *tag,
-                                            Motor_t *motor,
-                                            CurrentSense_t *cs)
-{
-    uint8_t was_enabled;
-    PhaseCurrent_t s_0;
-    PhaseCurrent_t s_pi;
-    PhaseCurrent_t s_pi_2;
-    PhaseCurrent_t s_3pi_2;
-    int8_t a_score = 0;
-    int8_t b_score = 0;
-    float uq = APP_CS_SIGN_TEST_UQ_V;
-
-    if ((motor == NULL) || (cs == NULL) || (motor->driver == NULL) || (!motor->driver->initialized)) {
-        USB_Debug_Printf("[CS-SIGN][%s] skip (motor/cs not ready)\r\n", tag);
-        return;
-    }
-
-    was_enabled = (uint8_t)motor->state.enabled;
-    if (!was_enabled) {
-        FOCMotor_enable(motor);
-        HAL_Delay(10);
-    }
-
-    if (!cs->enabled) {
-        CurrentSense_Enable(cs);
-        HAL_Delay(10);
-    }
-
-    /* 限制测试电压，避免符号测试时输出过大 */
-    if ((motor->driver->voltage_limit > 0.0f) && (uq > motor->driver->voltage_limit * 0.3f)) {
-        uq = motor->driver->voltage_limit * 0.3f;
-    }
-    if (uq < 0.3f) {
-        uq = 0.3f;
-    }
-
-    USB_Debug_Printf("[CS-SIGN][%s] test start A_SIGN=%d B_SIGN=%d uq=%.2fV\r\n",
-                     tag, cs->CsParam.A_SIGN, cs->CsParam.B_SIGN, uq);
-
-    s_0 = app_measure_phase_current_avg(motor, cs, uq, 0.0f);
-    s_pi = app_measure_phase_current_avg(motor, cs, uq, PI);
-    s_pi_2 = app_measure_phase_current_avg(motor, cs, uq, 0.5f * PI);
-    s_3pi_2 = app_measure_phase_current_avg(motor, cs, uq, 1.5f * PI);
-
-    Motor_SetPhaseVoltageQ(motor, 0.0f, 0.0f);
-
-    /* 根据理论符号关系打分，负分表示建议翻转采样符号 */
-    a_score += (app_sign_with_deadband(s_3pi_2.ia, APP_CS_SIGN_TEST_DEADBAND_A) == 1) ? 1 : -1;
-    a_score += (app_sign_with_deadband(s_pi_2.ia, APP_CS_SIGN_TEST_DEADBAND_A) == -1) ? 1 : -1;
-    b_score += (app_sign_with_deadband(s_0.ib, APP_CS_SIGN_TEST_DEADBAND_A) == 1) ? 1 : -1;
-    b_score += (app_sign_with_deadband(s_pi.ib, APP_CS_SIGN_TEST_DEADBAND_A) == -1) ? 1 : -1;
-
-    USB_Debug_Printf("[CS-SIGN][%s] theta0    : ia=% .4f ib=% .4f (expect ib>0)\r\n", tag, s_0.ia, s_0.ib);
-    USB_Debug_Printf("[CS-SIGN][%s] thetaPI   : ia=% .4f ib=% .4f (expect ib<0)\r\n", tag, s_pi.ia, s_pi.ib);
-    USB_Debug_Printf("[CS-SIGN][%s] thetaPI/2 : ia=% .4f ib=% .4f (expect ia<0)\r\n", tag, s_pi_2.ia, s_pi_2.ib);
-    USB_Debug_Printf("[CS-SIGN][%s] theta3PI/2: ia=% .4f ib=% .4f (expect ia>0)\r\n", tag, s_3pi_2.ia, s_3pi_2.ib);
-
-    USB_Debug_Printf("[CS-SIGN][%s] recommendation: A_SIGN %s (%d -> %d), B_SIGN %s (%d -> %d)\r\n",
-                     tag,
-                     (a_score >= 0) ? "KEEP" : "FLIP",
-                     cs->CsParam.A_SIGN,
-                     (a_score >= 0) ? cs->CsParam.A_SIGN : -cs->CsParam.A_SIGN,
-                     (b_score >= 0) ? "KEEP" : "FLIP",
-                     cs->CsParam.B_SIGN,
-                     (b_score >= 0) ? cs->CsParam.B_SIGN : -cs->CsParam.B_SIGN);
-
-    if (!was_enabled) {
-        FOCMotor_disable(motor);
-    }
-}
-
-
-/* 左右电机电流采样符号测试入口 */
-void App_CurrentSenseSignTest(void)
-{
-    USB_Debug_Printf("[CS-SIGN] test begin (run with motor unloaded and hold rotor still)\r\n");
-
-#if LEFT_MOTOR_ENABLE
-    app_current_sense_sign_test_one("L", &g_motor1, &g_current_sense1);
-#endif
-
-#if RIGHT_MOTOR_ENABLE
-    app_current_sense_sign_test_one("R", &g_motor2, &g_current_sense2);
-#endif
-
-    USB_Debug_Printf("[CS-SIGN] test end\r\n");
-}
-
-
-/* 计算两个角度之间的最短有符号差值，范围约为 [-π, π] */
-static float app_angle_diff_signed(float from, float to)
-{
-    float d = to - from;
-
-    while (d > PI) {
-        d -= 2.0f * PI;
-    }
-    while (d < -PI) {
-        d += 2.0f * PI;
-    }
-
-    return d;
-}
-
-
-/* 施加指定电角度电压矢量，等待转子稳定后读取机械角。
- * 用 DWT 做近似 ms 延时，同时持续刷新 Sensor。
- */
-static float app_sensor_angle_after_settle(Motor_t *motor,
-                                           Sensor_t *sensor,
-                                           float uq,
-                                           float elec_angle,
-                                           uint32_t settle_ms)
-{
-    uint32_t i;
-    uint32_t step_ms;
-    uint32_t t0;
-    uint32_t t1;
-    uint32_t ticks_per_ms;
-
-    Motor_SetPhaseVoltageQ(motor, uq, elec_angle);
-
-    ticks_per_ms = SystemCoreClock / 1000U;
-    if (ticks_per_ms == 0U) {
-        ticks_per_ms = 1U;
-    }
-
-    step_ms = settle_ms;
-    if (step_ms > APP_SENSOR_DIR_TEST_MAX_STEP_MS) {
-        step_ms = APP_SENSOR_DIR_TEST_MAX_STEP_MS;
-    }
-
-    for (i = 0U; i < step_ms; i++) {
-        Sensor_Update(sensor, 0.001f);
-
-        t0 = DWT_GetTicks();
-        do {
-            t1 = DWT_GetElapsedTicks(t0);
-        } while (t1 < ticks_per_ms);
-    }
-
-    Sensor_Update(sensor, 0.001f);
-    return Sensor_GetAngle(sensor);
-}
-
-
-/* 单电机传感器方向测试。
- * 正向电角度步进时机械角应该按同一方向变化；
- * 反向电角度步进时机械角应该反向变化。
- */
-static void app_sensor_direction_test_one(const char *tag, Motor_t *motor, Sensor_t *sensor)
-{
-    uint8_t was_enabled;
-    float uq = APP_SENSOR_DIR_TEST_UQ_V;
-    float a0;
-    float ap;
-    float an;
-    float dp;
-    float dn;
-    int8_t score = 0;
-
-    if ((motor == NULL) || (sensor == NULL) || (motor->driver == NULL) ||
-        (!motor->driver->initialized) || (!sensor->initialized)) {
-        USB_Debug_Printf("[DIR-TEST][%s] skip (motor/sensor not ready)\r\n", tag);
-        return;
-    }
-
-    was_enabled = (uint8_t)motor->state.enabled;
-    if (!was_enabled) {
-        FOCMotor_enable(motor);
-        HAL_Delay(10);
-    }
-
-    if ((motor->driver->voltage_limit > 0.0f) && (uq > motor->driver->voltage_limit * 0.3f)) {
-        uq = motor->driver->voltage_limit * 0.3f;
-    }
-    if (uq < 0.3f) {
-        uq = 0.3f;
-    }
-
-    USB_Debug_Printf("[DIR-TEST][%s] start uq=%.2fV elec_step=%.3f\r\n",
-                     tag, uq, APP_SENSOR_DIR_TEST_ELEC_STEP);
-
-    a0 = app_sensor_angle_after_settle(motor, sensor, uq, 0.0f, APP_SENSOR_DIR_TEST_SETTLE_MS);
-    ap = app_sensor_angle_after_settle(motor, sensor, uq, APP_SENSOR_DIR_TEST_ELEC_STEP, APP_SENSOR_DIR_TEST_SETTLE_MS);
-    an = app_sensor_angle_after_settle(motor, sensor, uq, -APP_SENSOR_DIR_TEST_ELEC_STEP, APP_SENSOR_DIR_TEST_SETTLE_MS);
-
-    Motor_SetPhaseVoltageQ(motor, 0.0f, 0.0f);
-
-    dp = app_angle_diff_signed(a0, ap);
-    dn = app_angle_diff_signed(a0, an);
-
-    if (dp > APP_SENSOR_DIR_TEST_DEADBAND_RAD) {
-        score++;
-    } else if (dp < -APP_SENSOR_DIR_TEST_DEADBAND_RAD) {
-        score--;
-    }
-
-    if (dn < -APP_SENSOR_DIR_TEST_DEADBAND_RAD) {
-        score++;
-    } else if (dn > APP_SENSOR_DIR_TEST_DEADBAND_RAD) {
-        score--;
-    }
-
-    USB_Debug_Printf("[DIR-TEST][%s] a0=%.4f ap=%.4f an=%.4f d_plus=%.4f d_minus=%.4f\r\n",
-                     tag, a0, ap, an, dp, dn);
-
-    if (score > 0) {
-        USB_Debug_Printf("[DIR-TEST][%s] recommendation: sensor_direction_cw\r\n", tag);
-    } else if (score < 0) {
-        USB_Debug_Printf("[DIR-TEST][%s] recommendation: sensor_direction_ccw\r\n", tag);
-    } else {
-        USB_Debug_Printf("[DIR-TEST][%s] recommendation: inconclusive (increase uq/settle time and retest)\r\n", tag);
-    }
-
-    if (!was_enabled) {
-        FOCMotor_disable(motor);
-    }
-}
-
-
-/* 左右电机传感器方向测试入口 */
-void App_SensorDirectionTest(void)
-{
-    USB_Debug_Printf("[DIR-TEST] begin (motor should be free to move, not held)\r\n");
-
-#if LEFT_MOTOR_ENABLE
-    app_sensor_direction_test_one("L", &g_motor1, &g_sensor1);
-#endif
-
-    HAL_Delay(500);
-
-#if RIGHT_MOTOR_ENABLE
-    app_sensor_direction_test_one("R", &g_motor2, &g_sensor2);
-#endif
-
-    USB_Debug_Printf("[DIR-TEST] end\r\n");
 }
 
 
@@ -1449,328 +613,6 @@ void App_ResetSpeedPIDs(void)
     __enable_irq();
 }
 
-
-#if APP_BUS_VOLTAGE_ENABLE
-static uint8_t App_BusVoltageStartupSample(void)
-{
-    uint32_t i;
-    uint32_t valid_count = 0U;
-    uint32_t raw_sum = 0U;
-    float adc_pin_sum = 0.0f;
-    float bus_sum = 0.0f;
-
-    g_bus_voltage_valid = 0U;
-
-    for (i = 0U; i < APP_BUS_VOLTAGE_STARTUP_SAMPLE_COUNT; i++) {
-        if (BusVoltage_SampleOnce(&g_bus_voltage)) {
-            const uint16_t raw_adc = BusVoltage_GetRawAdc(&g_bus_voltage);
-            const float adc_pin_voltage = BusVoltage_GetAdcPinVoltage(&g_bus_voltage);
-            const float bus_voltage = BusVoltage_GetBusVoltage(&g_bus_voltage);
-
-            if ((bus_voltage >= APP_BUS_VOLTAGE_VALID_MIN_V) &&
-                (bus_voltage <= APP_BUS_VOLTAGE_VALID_MAX_V)) {
-                raw_sum += raw_adc;
-                adc_pin_sum += adc_pin_voltage;
-                bus_sum += bus_voltage;
-                valid_count++;
-            }
-        }
-
-        HAL_Delay(1U);
-    }
-
-    if (valid_count == 0U) {
-        g_bus_voltage_debug.raw_adc = 0U;
-        g_bus_voltage_debug.adc_pin_voltage = 0.0f;
-        g_bus_voltage_debug.bus_voltage = 0.0f;
-        g_bus_voltage_filtered = 0.0f;
-        return 0U;
-    }
-
-    g_bus_voltage_debug.raw_adc =
-        (uint16_t)((raw_sum + (valid_count / 2U)) / valid_count);
-    g_bus_voltage_debug.adc_pin_voltage = adc_pin_sum / (float)valid_count;
-    g_bus_voltage_debug.bus_voltage = bus_sum / (float)valid_count;
-    g_bus_voltage_filtered = LowPassFilter_Update(&g_bus_voltage_lpf,
-                                                  g_bus_voltage_debug.bus_voltage);
-    g_bus_voltage_valid = 1U;
-
-    return 1U;
-}
-#endif
-
-
-static FastRingSample_t g_fastring_buf[APP_FASTRING_SIZE];
-static FastRingSample_t g_fastring_snapshot_buf[APP_FASTRING_SIZE];
-static volatile uint16_t g_fastring_head = 0U;
-static volatile uint16_t g_fastring_count = 0U;
-static volatile uint32_t g_fastring_write_seq = 0U;
-static volatile uint16_t g_fastring_snapshot_count = 0U;
-static volatile uint32_t g_fastring_snapshot_write_seq = 0U;
-
-
-
-
-static uint16_t app_fastring_status_flags_snapshot(void)
-{
-    uint16_t flags = 0U;
-
-    if (g_speed_fault1 > 0.5f) {
-        flags |= APP_FOC_STATUS_FLAG_SPEED_FAULT_L;
-    }
-    if (g_speed_fault2 > 0.5f) {
-        flags |= APP_FOC_STATUS_FLAG_SPEED_FAULT_R;
-    }
-    if (g_foc_stack_ready != 0U) {
-        flags |= APP_FOC_STATUS_FLAG_STACK_READY;
-    }
-    if (g_foc_control_it_enabled != 0U) {
-        flags |= APP_FOC_STATUS_FLAG_CONTROL_IT_ENABLED;
-    }
-    if (g_bus_voltage_valid != 0U) {
-        flags |= APP_FOC_STATUS_FLAG_BUS_VALID;
-    }
-    flags |= APP_FOC_STATUS_FLAG_CURRENT_LOOP_ACTIVE;
-#if APP_SPEED_LOOP_ENABLE
-    flags |= APP_FOC_STATUS_FLAG_SPEED_LOOP_ENABLED;
-#endif
-#if APP_CURRENT_LOOP_ENABLE
-    flags |= APP_FOC_STATUS_FLAG_CURRENT_LOOP_ENABLED;
-#endif
-    if (g_foc_power_stage_enabled == 0U) {
-        flags |= APP_FOC_STATUS_FLAG_POWER_STAGE_OFF;
-    }
-    if (App_Attitude_IsControlEnabled() != 0U) {
-        flags |= APP_FOC_STATUS_FLAG_ATTITUDE_CONTROL_ON;
-    }
-    return flags;
-}
-
-static int16_t app_fastlog_scale_to_i16(float value, float scale)
-{
-    float scaled;
-
-    if (scale == 0.0f) {
-        return 0;
-    }
-
-    scaled = value * scale;
-    if (scaled > 32767.0f) {
-        return 32767;
-    }
-    if (scaled < -32768.0f) {
-        return -32768;
-    }
-
-    return (int16_t)scaled;
-}
-
-void App_ResetFastRing(void)
-{
-    __disable_irq();
-    g_fastring_head = 0U;
-    g_fastring_count = 0U;
-    g_fastring_write_seq = 0U;
-    g_fastring_snapshot_count = 0U;
-    g_fastring_snapshot_write_seq = 0U;
-    __enable_irq();
-}
-
-void App_GetFastRingStatus(uint16_t *count,
-                           uint16_t *capacity,
-                           uint16_t *head,
-                           uint32_t *write_seq)
-{
-    uint16_t local_count;
-    uint16_t local_head;
-    uint32_t local_write_seq;
-
-    __disable_irq();
-    local_count = g_fastring_count;
-    local_head = g_fastring_head;
-    local_write_seq = g_fastring_write_seq;
-    __enable_irq();
-
-    if (count != NULL) {
-        *count = local_count;
-    }
-    if (capacity != NULL) {
-        *capacity = APP_FASTRING_SIZE;
-    }
-    if (head != NULL) {
-        *head = local_head;
-    }
-    if (write_seq != NULL) {
-        *write_seq = local_write_seq;
-    }
-}
-
-uint16_t App_CopyFastRingLatest(uint16_t start_idx,
-                                uint8_t max_samples,
-                                FastRingSample_t *out)
-{
-    uint16_t local_count;
-    uint16_t local_head;
-    uint16_t base_idx;
-    uint16_t available;
-    uint16_t i;
-
-    if ((out == NULL) || (max_samples == 0U)) {
-        return 0U;
-    }
-
-    __disable_irq();
-    local_count = g_fastring_count;
-    local_head = g_fastring_head;
-
-    if (start_idx >= local_count) {
-        __enable_irq();
-        return 0U;
-    }
-
-    available = (uint16_t)(local_count - start_idx);
-    if ((uint16_t)max_samples < available) {
-        available = (uint16_t)max_samples;
-    }
-
-    base_idx = (uint16_t)((local_head + APP_FASTRING_SIZE - local_count) % APP_FASTRING_SIZE);
-    for (i = 0U; i < available; i++) {
-        uint16_t ring_idx = (uint16_t)((base_idx + start_idx + i) % APP_FASTRING_SIZE);
-        out[i] = g_fastring_buf[ring_idx];
-    }
-    __enable_irq();
-
-    return available;
-}
-
-void App_SnapshotFastRing(uint16_t *count,
-                          uint16_t *capacity,
-                          uint32_t *write_seq)
-{
-    uint16_t local_count;
-    uint16_t local_head;
-    uint16_t base_idx;
-    uint16_t i;
-    uint32_t local_write_seq;
-
-    __disable_irq();
-    local_count = g_fastring_count;
-    local_head = g_fastring_head;
-    local_write_seq = g_fastring_write_seq;
-    __enable_irq();
-
-    base_idx = (uint16_t)((local_head + APP_FASTRING_SIZE - local_count) % APP_FASTRING_SIZE);
-    for (i = 0U; i < local_count; i++) {
-        uint16_t ring_idx = (uint16_t)((base_idx + i) % APP_FASTRING_SIZE);
-        g_fastring_snapshot_buf[i] = g_fastring_buf[ring_idx];
-    }
-
-    __disable_irq();
-    g_fastring_snapshot_count = local_count;
-    g_fastring_snapshot_write_seq = local_write_seq;
-    __enable_irq();
-
-    if (count != NULL) {
-        *count = local_count;
-    }
-    if (capacity != NULL) {
-        *capacity = APP_FASTRING_SIZE;
-    }
-    if (write_seq != NULL) {
-        *write_seq = local_write_seq;
-    }
-}
-
-void App_GetFastRingSnapshotStatus(uint16_t *count,
-                                   uint16_t *capacity,
-                                   uint32_t *write_seq)
-{
-    uint16_t local_count;
-    uint32_t local_write_seq;
-
-    __disable_irq();
-    local_count = g_fastring_snapshot_count;
-    local_write_seq = g_fastring_snapshot_write_seq;
-    __enable_irq();
-
-    if (count != NULL) {
-        *count = local_count;
-    }
-    if (capacity != NULL) {
-        *capacity = APP_FASTRING_SIZE;
-    }
-    if (write_seq != NULL) {
-        *write_seq = local_write_seq;
-    }
-}
-
-uint16_t App_CopyFastRingSnapshotChunk(uint32_t snapshot_write_seq,
-                                       uint16_t start_idx,
-                                       uint8_t max_samples,
-                                       FastRingSample_t *out)
-{
-    uint16_t local_count;
-    uint16_t available;
-    uint16_t i;
-
-    if ((out == NULL) || (max_samples == 0U)) {
-        return 0U;
-    }
-
-    __disable_irq();
-    if (snapshot_write_seq != g_fastring_snapshot_write_seq) {
-        __enable_irq();
-        return 0U;
-    }
-
-    local_count = g_fastring_snapshot_count;
-    if (start_idx >= local_count) {
-        __enable_irq();
-        return 0U;
-    }
-
-    available = (uint16_t)(local_count - start_idx);
-    if ((uint16_t)max_samples < available) {
-        available = (uint16_t)max_samples;
-    }
-
-    for (i = 0U; i < available; i++) {
-        out[i] = g_fastring_snapshot_buf[start_idx + i];
-    }
-    __enable_irq();
-
-    return available;
-}
-
-APP_FOC_HOT
-static void fastring_push_dual(void)
-{
-    FastRingSample_t *sample = &g_fastring_buf[g_fastring_head];
-
-    sample->target_iq_l_ma = app_fastlog_scale_to_i16(g_current_loop_debug1.target_iq, 1000.0f);
-    sample->iq_ref_l_ma = app_fastlog_scale_to_i16(g_current_loop_debug1.iq_ref, 1000.0f);
-    sample->filtered_iq_l_ma = app_fastlog_scale_to_i16(g_current_loop_debug1.filtered_iq, 1000.0f);
-    sample->raw_iq_l_ma = app_fastlog_scale_to_i16(g_current_loop_debug1.raw_iq, 1000.0f);
-    sample->uq_final_l_mv = app_fastlog_scale_to_i16(g_current_loop_debug1.uq_final, 1000.0f);
-
-    sample->target_iq_r_ma = app_fastlog_scale_to_i16(g_current_loop_debug2.target_iq, 1000.0f);
-    sample->iq_ref_r_ma = app_fastlog_scale_to_i16(g_current_loop_debug2.iq_ref, 1000.0f);
-    sample->filtered_iq_r_ma = app_fastlog_scale_to_i16(g_current_loop_debug2.filtered_iq, 1000.0f);
-    sample->raw_iq_r_ma = app_fastlog_scale_to_i16(g_current_loop_debug2.raw_iq, 1000.0f);
-    sample->uq_final_r_mv = app_fastlog_scale_to_i16(g_current_loop_debug2.uq_final, 1000.0f);
-
-    sample->bus_mv = (uint16_t)app_fastlog_scale_to_i16(g_bus_voltage_filtered, 1000.0f);
-    sample->sample_idx = (uint16_t)g_fastring_write_seq;
-    sample->status_flags = app_fastring_status_flags_snapshot();
-
-    g_fastring_head = (uint16_t)((g_fastring_head + 1U) % APP_FASTRING_SIZE);
-    if (g_fastring_count < APP_FASTRING_SIZE) {
-        g_fastring_count++;
-    }
-    g_fastring_write_seq++;
-}
-
-
 /* 10kHz FOC 主体：
  * 1. 更新传感器和电角度；
  * 2. 计算 sin/cos；
@@ -1882,7 +724,7 @@ static uint8_t loopFOC(void)
             Motor_SetPhaseVoltageQBySinCos(&g_motor2, 0.0f, sin_e2, cos_e2);
         }
 
-        fastring_push_dual();
+        App_FastRingPushDual();
     }
 
     return 1U;
@@ -1956,56 +798,12 @@ void App_LoopForIT(void)
 /* 主循环调试输出。 */
 void DebuginWhile(void)
 {
-    uint32_t now_ms;
-
-    now_ms = HAL_GetTick();
-#if APP_BUS_VOLTAGE_ENABLE
-    if ((now_ms - g_last_bus_voltage_sample_tick_ms) >= APP_BUS_VOLTAGE_SAMPLE_PERIOD_MS) {
-        g_last_bus_voltage_sample_tick_ms = now_ms;
-        App_ServiceBusVoltageSample();
-    }
-#endif
+    uint32_t now_ms = HAL_GetTick();
 
     if ((now_ms - g_last_while_debug_tick_ms) >= APP_LOOP_PRINT_PERIOD_MS) {
         g_last_while_debug_tick_ms = now_ms;
         /* 预留常规 while 调试输出入口，当前按需求先留空。 */
     }
-}
-
-
-
-
-
-
-
-static uint8_t App_InitBusVoltage(void)
-{
-    #if APP_BUS_VOLTAGE_ENABLE
-        BusVoltage_Setup(&g_bus_voltage, &hadc3);
-        BusVoltage_Enable(&g_bus_voltage);
-        LowPassFilter_Init(&g_bus_voltage_lpf,
-                        APP_BUS_VOLTAGE_LPF_CUTOFF_HZ,
-                        1000.0f / (float)APP_BUS_VOLTAGE_SAMPLE_PERIOD_MS);
-
-        if (!App_BusVoltageStartupSample()) {
-            USB_Debug_Printf("BusVoltage startup sample failed, PWM disabled\r\n");
-            return 0U;
-        }
-
-        USB_Debug_Printf("BusVoltage: ADC,PinV,BusV\r\n");
-        USB_Debug_Printf("%u,%.3f,%.3f\r\n",
-                        (unsigned)g_bus_voltage_debug.raw_adc,
-                        g_bus_voltage_debug.adc_pin_voltage,
-                        g_bus_voltage_debug.bus_voltage);
-    #else
-        g_bus_voltage_valid = 1U;
-        g_bus_voltage_debug.raw_adc = 0U;
-        g_bus_voltage_debug.adc_pin_voltage = 0.0f;
-        g_bus_voltage_debug.bus_voltage = V_SUPPLY;
-        g_bus_voltage_filtered = V_SUPPLY;
-        USB_Debug_Printf("BusVoltage disabled, use fixed V_SUPPLY=%.3f\r\n", V_SUPPLY);
-    #endif
-        return 1U;
 }
 
 
