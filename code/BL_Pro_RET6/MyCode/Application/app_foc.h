@@ -1,7 +1,15 @@
 #ifndef APP_FOC_H
 #define APP_FOC_H
 
+
+#define FOC_ENABLE_CURRENT_LOOP 1
+#define FOC_ENABLE_POSITION_LOOP 0
+#define FOC_ENABLE_VELOCITY_LOOP 0
+
+
+
 #include <stdint.h>
+#include "app_foc_control.h"
 
 #define APP_FOC_STATUS_FLAG_SPEED_FAULT_L        (1U << 0)
 #define APP_FOC_STATUS_FLAG_SPEED_FAULT_R        (1U << 1)
@@ -17,7 +25,6 @@
 uint8_t App_FOCStack_Init(void);
 uint8_t App_StartupCalibrate(void);
 void App_Loop(void);
-void App_FOCControlIT_Enable(void);
 void App_LoopForIT(void);
 void DebuginWhile(void);
 void App_ResetSpeedPIDs(void);
@@ -28,10 +35,6 @@ uint8_t App_FOC_IsPowerStageEnabled(void);
 uint8_t App_FOC_SetDriverGateEnabled(uint8_t enable);
 
 /* DebugLink 用的状态变量 */
-extern float vel_windowed_f1;
-extern float vel_windowed_f2;
-extern float Left_FilteredIq;
-extern float Right_FilteredIq;
 extern float uq_cmd1;
 extern float uq_cmd2;
 extern float g_speed_fault1;

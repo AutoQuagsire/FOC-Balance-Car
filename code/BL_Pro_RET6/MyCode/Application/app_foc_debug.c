@@ -95,8 +95,8 @@ void App_FOC_GetTelemetry(App_FOCTelemetry_t *telemetry)
     snapshot.status_flags = 0U;
 
     __disable_irq();
-    snapshot.wheel_vel_left_radps = vel_windowed_f1;
-    snapshot.wheel_vel_right_radps = vel_windowed_f2;
+    snapshot.wheel_vel_left_radps = g_foc_left_control.velocity.speed_meas_radps;
+    snapshot.wheel_vel_right_radps = g_foc_right_control.velocity.speed_meas_radps;
     snapshot.filtered_iq_left_a = g_current_loop_debug1.filtered_iq;
     snapshot.filtered_iq_right_a = g_current_loop_debug2.filtered_iq;
     snapshot.uq_left_v = g_current_loop_debug1.uq_final;
@@ -169,6 +169,15 @@ static void App_CurrentPIDApplyOne(PID_t *pid, float kp, float ki, float kd, flo
     App_PIDResetRuntime(pid);
 }
 
+static PID_t *App_CurrentPIDGetOneByMode(uint8_t mode)
+{
+    if (mode == 0U) {
+        return &g_foc_left_control.current.pid_ff;
+    }
+
+    return &g_foc_left_control.current.pid_pi;
+}
+
 static void App_CurrentPIDSelectPairByMode(uint8_t mode, PID_t **pid1, PID_t **pid2)
 {
     if ((pid1 == NULL) || (pid2 == NULL)) {
@@ -176,12 +185,13 @@ static void App_CurrentPIDSelectPairByMode(uint8_t mode, PID_t **pid1, PID_t **p
     }
 
     if (mode == 0U) {
-        *pid1 = &g_current_pid1;
-        *pid2 = &g_current_pid2;
-    } else {
-        *pid1 = &g_current_pid1_Common;
-        *pid2 = &g_current_pid2_Common;
+        *pid1 = &g_foc_left_control.current.pid_ff;
+        *pid2 = &g_foc_right_control.current.pid_ff;
+        return;
     }
+
+    *pid1 = &g_foc_left_control.current.pid_pi;
+    *pid2 = &g_foc_right_control.current.pid_pi;
 }
 
 static void App_CurrentPIDReinitOneWithExisting(PID_t *pid,
@@ -229,11 +239,7 @@ void App_CurrentPID_GetSame(float *kp, float *ki, float *kd, float *integral_lim
     float local_ilim;
     PID_t *pid;
 
-    if (g_current_pid_mode == 0U) {
-        pid = &g_current_pid1;
-    } else {
-        pid = &g_current_pid1_Common;
-    }
+    pid = App_CurrentPIDGetOneByMode(g_current_pid_mode);
 
     __disable_irq();
     local_kp = pid->Kp;
@@ -304,11 +310,7 @@ uint8_t App_CurrentPID_GetOutputLimit(float *output_limit)
         return 0U;
     }
 
-    if (g_current_pid_mode == 0U) {
-        pid = &g_current_pid1;
-    } else {
-        pid = &g_current_pid1_Common;
-    }
+    pid = App_CurrentPIDGetOneByMode(g_current_pid_mode);
 
     __disable_irq();
     value = pid->output_limit;
@@ -343,11 +345,7 @@ uint8_t App_CurrentPID_GetIErrMin(float *i_err_min)
         return 0U;
     }
 
-    if (g_current_pid_mode == 0U) {
-        pid = &g_current_pid1;
-    } else {
-        pid = &g_current_pid1_Common;
-    }
+    pid = App_CurrentPIDGetOneByMode(g_current_pid_mode);
 
     __disable_irq();
     value = pid->I_ERR_MIN;
@@ -398,10 +396,10 @@ void App_ResetCurrentPIDs(void)
 {
     __disable_irq();
 
-    App_PIDResetRuntime(&g_current_pid1);
-    App_PIDResetRuntime(&g_current_pid2);
-    App_PIDResetRuntime(&g_current_pid1_Common);
-    App_PIDResetRuntime(&g_current_pid2_Common);
+    App_PIDResetRuntime(&g_foc_left_control.current.pid_ff);
+    App_PIDResetRuntime(&g_foc_right_control.current.pid_ff);
+    App_PIDResetRuntime(&g_foc_left_control.current.pid_pi);
+    App_PIDResetRuntime(&g_foc_right_control.current.pid_pi);
 
     App_CurrentLoopDebugClear(&g_current_loop_debug1);
     App_CurrentLoopDebugClear(&g_current_loop_debug2);
@@ -409,8 +407,8 @@ void App_ResetCurrentPIDs(void)
     g_current_i_unload_limit_ticks1 = 0U;
     g_current_i_unload_limit_ticks2 = 0U;
 
-    g_current_iq_ref1 = g_iq_target_left;
-    g_current_iq_ref2 = g_iq_target_right;
+    g_foc_left_control.current.iq_ref = g_foc_left_control.current.iq_target;
+    g_foc_right_control.current.iq_ref = g_foc_right_control.current.iq_target;
 
     __enable_irq();
 }

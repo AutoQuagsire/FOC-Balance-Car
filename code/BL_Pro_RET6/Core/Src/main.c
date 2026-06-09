@@ -29,6 +29,7 @@
 #include "app_foc.h"
 #include "app_foc_bus.h"
 #include "app_foc_debug.h"
+#include "app_foc_itTimer.h"
 #include "app_attitude.h"
 #include "usb_debug.h"
 #include "icm42688p.h"
@@ -139,7 +140,7 @@ int main(void)
           USB_Debug_Printf("FOC startup calibrate failed, keep stack init only\r\n");
       }
   }
-  App_FOCControlIT_Enable();
+  App_FOCControlIT_Enable(&htim5);
 
   /* USER CODE END 2 */
 

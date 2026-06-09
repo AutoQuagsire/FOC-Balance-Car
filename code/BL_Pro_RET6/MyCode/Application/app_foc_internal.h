@@ -6,6 +6,7 @@
 #include "BLDCMotor.h"
 #include "BusVoltage.h"
 #include "PID.h"
+#include "app_foc_control.h"
 #include "current_sense.h"
 #include "driver.h"
 #include "sensor.h"
@@ -43,11 +44,6 @@ extern Sensor_t g_sensor2;
 extern CurrentSense_t g_current_sense1;
 extern CurrentSense_t g_current_sense2;
 
-extern PID_t g_current_pid1;
-extern PID_t g_current_pid1_Common;
-extern PID_t g_current_pid2;
-extern PID_t g_current_pid2_Common;
-
 extern volatile CurrentLoopDebugSnapshot_t g_current_loop_debug1;
 extern volatile CurrentLoopDebugSnapshot_t g_current_loop_debug2;
 
@@ -57,12 +53,6 @@ extern volatile float g_current_i_sep_ratio_pure;
 
 extern uint8_t g_current_i_unload_limit_ticks1;
 extern uint8_t g_current_i_unload_limit_ticks2;
-extern float g_current_iq_ref1;
-extern float g_current_iq_ref2;
-extern volatile float g_iq_target_left;
-extern volatile float g_iq_target_right;
-extern float vel_windowed_f1;
-extern float vel_windowed_f2;
 extern float g_speed_fault1;
 extern float g_speed_fault2;
 

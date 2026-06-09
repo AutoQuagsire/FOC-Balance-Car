@@ -7,6 +7,74 @@
 #define Uq_max 6.0f
 #endif
 
+/* ============================================================
+ * 电流环自适应参数调度表
+ *
+ * 根据 |target_iq| 插值得到：
+ * 1. ff_coef        ：前馈系数
+ * 2. integral_limit ：积分限幅
+ * ============================================================ */
+static const CurrentLoopSchedulePoint_t current_loop_schedule_table[] = {
+    {0.03f, 0.420f, 0.300f},
+    {0.10f, 0.460f, 0.300f},
+    {0.30f, 0.485f, 0.400f},
+    {0.60f, 0.500f, 0.500f},
+    {0.90f, 0.510f, 0.550f},
+    {1.20f, 0.520f, 0.580f},
+    {1.50f, 0.530f, 0.600f},
+    {1.80f, 0.540f, 0.650f},
+};
+
+void CurrentLoop_GetScheduledParams(float target_iq,
+                                    float *ff_coef,
+                                    float *integral_limit)
+{
+    float iq_abs;
+    size_t i;
+    size_t point_count;
+
+    if ((ff_coef == NULL) || (integral_limit == NULL)) {
+        return;
+    }
+
+    point_count = sizeof(current_loop_schedule_table) / sizeof(current_loop_schedule_table[0]);
+    if (point_count == 0U) {
+        *ff_coef = 0.0f;
+        *integral_limit = 0.0f;
+        return;
+    }
+
+    iq_abs = fabsf(target_iq);
+
+    if (iq_abs <= current_loop_schedule_table[0].iq_abs) {
+        *ff_coef = current_loop_schedule_table[0].ff_coef;
+        *integral_limit = current_loop_schedule_table[0].integral_limit;
+        return;
+    }
+
+    for (i = 1U; i < point_count; ++i) {
+        const CurrentLoopSchedulePoint_t *prev = &current_loop_schedule_table[i - 1U];
+        const CurrentLoopSchedulePoint_t *next = &current_loop_schedule_table[i];
+
+        if (iq_abs <= next->iq_abs) {
+            float span = next->iq_abs - prev->iq_abs;
+            float t = 0.0f;
+
+            if (span > 0.0f) {
+                t = (iq_abs - prev->iq_abs) / span;
+            }
+
+            *ff_coef = prev->ff_coef + t * (next->ff_coef - prev->ff_coef);
+            *integral_limit = prev->integral_limit +
+                              t * (next->integral_limit - prev->integral_limit);
+            return;
+        }
+    }
+
+    *ff_coef = current_loop_schedule_table[point_count - 1U].ff_coef;
+    *integral_limit = current_loop_schedule_table[point_count - 1U].integral_limit;
+}
+
 
 /* 清空 PID 运行状态。
  * 注意：这里只清积分、上次误差和输出，不改变 Kp/Ki/Kd 等参数。

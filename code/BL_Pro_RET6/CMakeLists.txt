@@ -65,6 +65,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     MyCode/Application/app_foc.c
     MyCode/Application/app_foc_bus.c
     MyCode/Application/app_foc_debug.c
+    MyCode/Application/app_foc_itTimer.c
     MyCode/Application/app_foc_test.c
     MyCode/Application/app_attitude.c
     MyCode/Algorithm/PID.c

@@ -26,11 +26,13 @@
 #include "current_sense.h"
 #include "sensor.h"
 
-
 /* ============================================================
  * 电流环编译期配置宏
  * ============================================================
  */
+#define BLDCMOTOR_ENABLE_CURRENT_SENSE 1
+
+
 
 /**
  * @brief 是否启用电流环前馈 PI 控制
@@ -561,5 +563,7 @@ uint8_t Motor_CalibrateZeroElectricalAngle(Motor_t *motor,
                                            float align_voltage,
                                            float align_angle,
                                            uint16_t settle_ms);
-
+uint8_t Motor_SetControlMode(Motor_t *motor,
+                             MotorOuterLoopMode_t outer_loop,
+                             MotorInnerLoopMode_t inner_loop);
 #endif /* BLDC_MOTOR_H */
