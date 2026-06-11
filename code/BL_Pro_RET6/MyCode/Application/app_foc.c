@@ -126,8 +126,8 @@ App_FOCMotorControl_t   g_foc_right_control = {
 };
 
 
-static uint32_t         g_last_loop_tick_ms = 0U;
-static uint32_t         g_last_print_tick_ms = 0U;
+
+
 static uint32_t         g_last_while_debug_tick_ms = 0U;
 volatile CurrentLoopDebugSnapshot_t g_current_loop_debug1;
 volatile CurrentLoopDebugSnapshot_t g_current_loop_debug2;
@@ -137,7 +137,6 @@ volatile uint32_t g_foc_last_loop_tick_ms = 0U;
 uint8_t g_current_i_unload_limit_ticks1 = 0U;
 uint8_t g_current_i_unload_limit_ticks2 = 0U;
 
-PID_t Left_Velocity_FOC_PID;
 volatile uint8_t g_current_pid_mode = 0U; /* 0=CurrentLoop_FFPI_V1, 1=Pure PI compare */
 volatile float g_current_i_sep_ratio_ff = CURRENT_LOOP_I_SEP_RATIO;
 volatile float g_current_i_sep_ratio_pure = CURRENT_LOOP_PURE_PI_I_SEP_RATIO;
@@ -151,7 +150,6 @@ float g_speed_fault1 = 0.0f;
 #define APP_LOOP_TEST_UQ_V        (1.0f)
 #define APP_LOOP_PRINT_PERIOD_MS  (100U)
 
-#define APP_SPEED_TARGET_RAD_S     (10.0f)
 #define APP_SPEED_KP               (0.055f)
 #define APP_SPEED_KI               (0.00035f)
 #define APP_SPEED_KD               (0.0f)
@@ -159,13 +157,9 @@ float g_speed_fault1 = 0.0f;
 #define APP_SPEED_I_LIMIT          (0.5f)
 #define APP_SPEED_I_ERR_MIN        (0.05f)
 #define APP_SPEED_I_SEP_RATIO      (0.75f)
-#define APP_SPEED_VEL_FAULT_ABS    (80.0f)
 
 
 #define APP_CURRENT_TARGET_A       (0.0f)
-#define APP_CURRENT_KP             (2.5)
-#define APP_CURRENT_KI             (0.2f)
-#define APP_CURRENT_KD             (0.0f)
 
 #define APP_LEFT_WHEEL_SPEED_SIGN   (1.0f)
 #define APP_RIGHT_WHEEL_SPEED_SIGN  (-1.0f)
@@ -184,21 +178,6 @@ float g_speed_fault1 = 0.0f;
 #error "APP_MOVE_DOWNSAMPLE must be >= 1"
 #endif
 
-/* 重置 PID 运行状态：只清积分、上次误差和输出，不改 PID 参数 */
-void App_PIDResetRuntime(PID_t *pid)
-{
-    PID_Reset(pid);
-}
-
-
-/* 重置速度环 PID 运行状态 */
-void App_ResetSpeedPIDs(void)
-{
-    __disable_irq();
-    App_PIDResetRuntime(&g_foc_left_control.velocity.speed_pid);
-    App_PIDResetRuntime(&g_foc_right_control.velocity.speed_pid);
-    __enable_irq();
-}
 
 /* 对外部 target_iq 做斜率限制，生成电流环内部目标 iq_ref。
  * 目的：把硬阶跃变成较平滑的内部参考，降低超调和下冲。
@@ -356,29 +335,9 @@ static float App_CurrentLoopComputeUq(Motor_t *motor,
 
 
 
-void App_FOC_SetIqTarget(float left_iq, float right_iq)
-{
-    __disable_irq();
-    g_foc_left_control.current.iq_target = left_iq;
-    g_foc_right_control.current.iq_target = right_iq;
-    __enable_irq();
-}
 
 
 
-float App_FOC_GetAverageWheelSpeedRadps(void)
-{
-    float left_speed;
-    float right_speed;
-
-    __disable_irq();
-    left_speed = g_foc_left_control.velocity.speed_meas_radps;
-    right_speed = g_foc_right_control.velocity.speed_meas_radps;
-    __enable_irq();
-
-    return 0.5f * ((APP_LEFT_WHEEL_SPEED_SIGN * left_speed) +
-                   (APP_RIGHT_WHEEL_SPEED_SIGN * right_speed));
-}
 
 /* 上电零位电角度校准。
  * 当前左右电机均使用 q 轴固定矢量吸附转子，再反算 zero_electrical_angle。
@@ -407,168 +366,11 @@ uint8_t App_StartupCalibrate(void)
 }
 
 
-/* 非中断版应用循环：主要用于早期开环/速度环调试。
- * 正式 10kHz FOC 闭环目前走 App_LoopForIT()。
- */
-void App_Loop(void)
-{
-    uint32_t now_ms = HAL_GetTick();
-
-    if (g_last_loop_tick_ms == 0U) {
-        g_last_loop_tick_ms = now_ms;
-        return;
-    }
-
-    uint32_t dt_ms = now_ms - g_last_loop_tick_ms;
-    if (dt_ms == 0U) {
-        return;
-    }
-
-    g_last_loop_tick_ms = now_ms;
-
-    float dt = (float)dt_ms * 0.001f;
-
-    if (!Motor_UpdateSensor(&g_motor1, dt)) {
-        return;
-    }
-
-    float elec_angle = g_motor1.electrical_angle;
-    float vel = Sensor_GetVelocityRaw(&g_sensor1);
-    float uq_cmd = APP_LOOP_TEST_UQ_V;
-    float vel_target = g_foc_left_control.velocity.speed_target_radps;
-    float vel_error = vel_target - vel;
-
-#if APP_SPEED_LOOP_ENABLE
-    if (fabsf(vel) > APP_SPEED_VEL_FAULT_ABS) {
-        g_speed_fault1 = 1U;
-    }
-
-    if (!g_speed_fault1) {
-        PID_Calculate(&g_foc_left_control.velocity.speed_pid, vel_target, vel, 0U);
-        uq_cmd = g_foc_left_control.velocity.speed_pid.output;
-    } else {
-        uq_cmd = 0.0f;
-    }
-#endif
-
-    float sin_e1 = 0.0f;
-    float cos_e1 = 0.0f;
-
-    Get_SinCos(elec_angle, &sin_e1, &cos_e1);
-    Motor_SetPhaseVoltageQBySinCos(&g_motor1, uq_cmd, sin_e1, cos_e1);
-
-    if ((now_ms - g_last_print_tick_ms) >= APP_LOOP_PRINT_PERIOD_MS) {
-        g_last_print_tick_ms = now_ms;
-
-#if APP_SPEED_LOOP_ENABLE
-        USB_Debug_Printf("tgt=%.2f vel=%.3f err=%.3f uq=%.2f mech=%.4f elec=%.4f fault=%u\r\n",
-                         vel_target,
-                         vel,
-                         vel_error,
-                         uq_cmd,
-                         Sensor_GetAngle(&g_sensor1),
-                         g_motor1.electrical_angle,
-                         (unsigned)g_speed_fault1);
-#else
-        USB_Debug_Printf("mech=%.4f elec=%.4f vel=%.3f uq=%.2f\r\n",
-                         Sensor_GetAngle(&g_sensor1),
-                         g_motor1.electrical_angle,
-                         vel,
-                         uq_cmd);
-#endif
-    }
-}
 
 
-uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable)
-{
-    uint8_t should_restore_tim5_irq = 0U;
-
-    if (enable > 1U) {
-        return 0U;
-    }
-
-    if (enable != 0U) {
-        if ((g_foc_stack_ready == 0U) ||
-            (g_foc_control_it_enabled == 0U) ||
-            (g_bus_voltage_valid == 0U)) {
-            return 0U;
-        }
-    }
-
-    if (g_foc_control_it_enabled != 0U) {
-        HAL_NVIC_DisableIRQ(TIM5_IRQn);
-        should_restore_tim5_irq = 1U; 
-    }
-
-    App_FOC_SetIqTarget(0.0f, 0.0f);
-    App_ResetSpeedPIDs();
-    App_ResetCurrentPIDs(&g_foc_left_control);
-    App_ResetCurrentPIDs(&g_foc_right_control);
-
-    if (enable == 0U) {
-        (void)App_Attitude_SetControlEnabled(0U);
-        App_FOC_ForcePowerStageOff();
-    } else {
-#if LEFT_MOTOR_ENABLE
-        FOCMotor_enable(&g_motor1);
-#endif
-#if RIGHT_MOTOR_ENABLE
-        FOCMotor_enable(&g_motor2);
-#endif
-        g_foc_power_stage_enabled = 1U;
-    }
-
-    if (should_restore_tim5_irq != 0U) {
-        HAL_NVIC_EnableIRQ(TIM5_IRQn);
-    }
-
-    return 1U;
-}
-
-uint8_t App_FOC_IsPowerStageEnabled(void)
-{
-    return g_foc_power_stage_enabled;
-}
-
-uint8_t App_FOC_SetDriverGateEnabled(uint8_t enable)
-{
-    uint8_t applied = 0U;
-
-    if (enable > 1U) {
-        return 0U;
-    }
-
-#if LEFT_MOTOR_ENABLE
-    if (g_driver1 != NULL) {
-        if (enable != 0U) {
-            Driver_Enable(g_driver1);
-        } else {
-            Driver_Disable(g_driver1);
-        }
-        applied = 1U;
-    }
-#endif
-
-#if RIGHT_MOTOR_ENABLE
-    if (g_driver2 != NULL) {
-        if (enable != 0U) {
-            Driver_Enable(g_driver2);
-        } else {
-            Driver_Disable(g_driver2);
-        }
-        applied = 1U;
-    }
-#endif
-
-    return applied;
-}
-
-float vel1 = 0;
 float vel_windowed1 = 0;
 float uq_cmd1 = APP_LOOP_TEST_UQ_V;
 
-float vel2 = 0;
 float vel_windowed2 = 0;
 float uq_cmd2 = APP_LOOP_TEST_UQ_V;
 
@@ -716,11 +518,9 @@ static void move(void)
     float vel_target1 = left->velocity.speed_target_radps;
     float vel_target2 = right->velocity.speed_target_radps;
 
-    vel1 = Sensor_GetVelocityRaw(&g_sensor1);
     vel_windowed1 = Sensor_GetVelocityWindowed(&g_sensor1);
     left->velocity.speed_meas_radps = LowPassFilter_Update(&left->velocity.speed_lpf, vel_windowed1);
 
-    vel2 = Sensor_GetVelocityRaw(&g_sensor2);
     vel_windowed2 = Sensor_GetVelocityWindowed(&g_sensor2);
     right->velocity.speed_meas_radps = LowPassFilter_Update(&right->velocity.speed_lpf, vel_windowed2);
 
@@ -735,8 +535,6 @@ static void move(void)
     uq_cmd2 = APP_LOOP_TEST_UQ_V;
 #endif
 
-    /* 保存左速度环调试数据 */
-    Left_Velocity_FOC_PID = left->velocity.speed_pid;
     pid_csv_data.timestamp_ms = HAL_GetTick();
     pid_csv_data.setpoint = vel_target1;
     pid_csv_data.input = left->velocity.speed_meas_radps;
@@ -1042,7 +840,6 @@ static uint8_t App_ConfigureLoopController(App_FOCMotorControl_t *control,
                                 APP_SPEED_I_SEP_RATIO);
 
         if (control == &g_foc_left_control) {
-            Left_Velocity_FOC_PID = control->velocity.speed_pid;
             g_speed_fault1 = 0U;
         } else if (control == &g_foc_right_control) {
             g_speed_fault2 = 0U;
@@ -1160,4 +957,132 @@ static uint8_t App_InitFOCAlgorithm(App_FOCMotorControl_t *control)
 #endif
 
     return App_ConfigureLoopController(control, motor->config.outer_loop);
+}
+
+
+
+
+void App_FOC_SetIqTarget(float left_iq, float right_iq)
+{
+    __disable_irq();
+    g_foc_left_control.current.iq_target = left_iq;
+    g_foc_right_control.current.iq_target = right_iq;
+    __enable_irq();
+}
+
+
+float App_FOC_GetAverageWheelSpeedRadps(void)
+{
+    float left_speed;
+    float right_speed;
+
+    __disable_irq();
+    left_speed = g_foc_left_control.velocity.speed_meas_radps;
+    right_speed = g_foc_right_control.velocity.speed_meas_radps;
+    __enable_irq();
+
+    return 0.5f * ((APP_LEFT_WHEEL_SPEED_SIGN * left_speed) +
+                   (APP_RIGHT_WHEEL_SPEED_SIGN * right_speed));
+}
+
+uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable)
+{
+    uint8_t should_restore_tim5_irq = 0U;
+
+    if (enable > 1U) {
+        return 0U;
+    }
+
+    if (enable != 0U) {
+        if ((g_foc_stack_ready == 0U) ||
+            (g_foc_control_it_enabled == 0U) ||
+            (g_bus_voltage_valid == 0U)) {
+            return 0U;
+        }
+    }
+
+    if (g_foc_control_it_enabled != 0U) {
+        HAL_NVIC_DisableIRQ(TIM5_IRQn);
+        should_restore_tim5_irq = 1U; 
+    }
+
+    App_FOC_SetIqTarget(0.0f, 0.0f);
+    App_ResetSpeedPIDs();
+    App_ResetCurrentPIDs(&g_foc_left_control);
+    App_ResetCurrentPIDs(&g_foc_right_control);
+
+    if (enable == 0U) {
+        (void)App_Attitude_SetControlEnabled(0U);
+        App_FOC_ForcePowerStageOff();
+    } else {
+#if LEFT_MOTOR_ENABLE
+        FOCMotor_enable(&g_motor1);
+#endif
+#if RIGHT_MOTOR_ENABLE
+        FOCMotor_enable(&g_motor2);
+#endif
+        g_foc_power_stage_enabled = 1U;
+    }
+
+    if (should_restore_tim5_irq != 0U) {
+        HAL_NVIC_EnableIRQ(TIM5_IRQn);
+    }
+
+    return 1U;
+}
+
+uint8_t App_FOC_IsPowerStageEnabled(void)
+{
+    return g_foc_power_stage_enabled;
+}
+
+uint8_t App_FOC_SetDriverGateEnabled(uint8_t enable)
+{
+    uint8_t applied = 0U;
+
+    if (enable > 1U) {
+        return 0U;
+    }
+
+#if LEFT_MOTOR_ENABLE
+    if (g_driver1 != NULL) {
+        if (enable != 0U) {
+            Driver_Enable(g_driver1);
+        } else {
+            Driver_Disable(g_driver1);
+        }
+        applied = 1U;
+    }
+#endif
+
+#if RIGHT_MOTOR_ENABLE
+    if (g_driver2 != NULL) {
+        if (enable != 0U) {
+            Driver_Enable(g_driver2);
+        } else {
+            Driver_Disable(g_driver2);
+        }
+        applied = 1U;
+    }
+#endif
+
+    return applied;
+}
+
+
+
+/* 重置 PID 运行状态：只清积分、上次误差和输出，不改 PID 参数 */
+void App_PIDResetRuntime(PID_t *pid)
+{
+    PID_Reset(pid);
+}
+
+
+/* 重置速度环 PID 运行状态 */
+void App_ResetSpeedPIDs(void)
+{
+    __disable_irq();
+    App_PIDResetRuntime(&g_foc_left_control.velocity.speed_pid);
+    App_PIDResetRuntime(&g_foc_right_control.velocity.speed_pid);
+    __enable_irq();
 }
