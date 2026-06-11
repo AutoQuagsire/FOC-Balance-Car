@@ -275,7 +275,8 @@ uint8_t App_CurrentPID_SetMode(uint8_t mode)
     __disable_irq();
     g_current_pid_mode = mode;
     __enable_irq();
-    App_ResetCurrentPIDs();
+    App_ResetCurrentPIDs(&g_foc_left_control);
+    App_ResetCurrentPIDs(&g_foc_right_control);
     return 1U;
 }
 
@@ -392,23 +393,35 @@ uint8_t App_CurrentPID_GetISepRatio(float *i_sep_ratio)
     return 1U;
 }
 
-void App_ResetCurrentPIDs(void)
+void App_ResetCurrentPIDs(App_FOCMotorControl_t *control)
 {
+    volatile CurrentLoopDebugSnapshot_t *debug = NULL;
+    uint8_t *i_unload_limit_ticks = NULL;
+
+    if (control == NULL) {
+        return;
+    }
+
+    if (control == &g_foc_left_control) {
+        debug = &g_current_loop_debug1;
+        i_unload_limit_ticks = &g_current_i_unload_limit_ticks1;
+    } else if (control == &g_foc_right_control) {
+        debug = &g_current_loop_debug2;
+        i_unload_limit_ticks = &g_current_i_unload_limit_ticks2;
+    } else {
+        return;
+    }
+
     __disable_irq();
 
-    App_PIDResetRuntime(&g_foc_left_control.current.pid_ff);
-    App_PIDResetRuntime(&g_foc_right_control.current.pid_ff);
-    App_PIDResetRuntime(&g_foc_left_control.current.pid_pi);
-    App_PIDResetRuntime(&g_foc_right_control.current.pid_pi);
+    App_PIDResetRuntime(&control->current.pid_ff);
+    App_PIDResetRuntime(&control->current.pid_pi);
 
-    App_CurrentLoopDebugClear(&g_current_loop_debug1);
-    App_CurrentLoopDebugClear(&g_current_loop_debug2);
+    App_CurrentLoopDebugClear(debug);
 
-    g_current_i_unload_limit_ticks1 = 0U;
-    g_current_i_unload_limit_ticks2 = 0U;
+    *i_unload_limit_ticks = 0U;
 
-    g_foc_left_control.current.iq_ref = g_foc_left_control.current.iq_target;
-    g_foc_right_control.current.iq_ref = g_foc_right_control.current.iq_target;
+    control->current.iq_ref = control->current.iq_target;
 
     __enable_irq();
 }

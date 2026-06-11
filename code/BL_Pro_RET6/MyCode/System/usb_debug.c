@@ -55,7 +55,8 @@ static void process_pid_update_motor_holdoff(void)
         pid_update_motor_holdoff_active = 0U;
         USB_Debug_Printf("# Motor driver re-enabled after command update holdoff\r\n");
         App_ResetSpeedPIDs();
-        App_ResetCurrentPIDs();
+        App_ResetCurrentPIDs(&g_foc_left_control);
+        App_ResetCurrentPIDs(&g_foc_right_control);
 
         if (pid_update_ack_pending)
         {
@@ -299,7 +300,8 @@ static void handle_one_command(const char *cmd)
 
     if (strncmp(cmd, "PID RESET", 9) == 0)
     {
-        App_ResetCurrentPIDs();
+        App_ResetCurrentPIDs(&g_foc_left_control);
+        App_ResetCurrentPIDs(&g_foc_right_control);
         App_ResetSpeedPIDs();
         USB_Debug_Printf("# PID runtime state reset\r\n");
         return;

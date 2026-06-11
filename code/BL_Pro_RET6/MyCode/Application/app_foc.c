@@ -30,8 +30,9 @@
 
 static uint8_t App_InitMotor1Stack(void);
 static uint8_t App_InitMotor2Stack(void);
-static uint8_t App_InitFOCAlgorithm(void);
-static uint8_t App_InitFOCAlgorithmT(Motor_t *motor);
+static uint8_t App_InitFOCAlgorithm(App_FOCMotorControl_t *control);
+static uint8_t App_ConfigureLoopController(App_FOCMotorControl_t *control,
+                                           MotorOuterLoopMode_t outer_loop);
 static void App_FOC_ForcePowerStageOff(void);
 
 volatile uint8_t g_foc_stack_ready = 0U;
@@ -76,10 +77,6 @@ uint8_t App_FOCStack_Init(void)
         return 0U;
     }
 
-    if (!App_InitFOCAlgorithm()) {
-        USB_Debug_Printf("FOC algorithm init failed\r\n");
-        return 0U;
-    }
     App_FOC_ForcePowerStageOff();
     App_ResetFastRing();
     g_foc_stack_ready = 1U;
@@ -113,7 +110,7 @@ CurrentSense_t          g_current_sense1; // 电流采样对象
 App_FOCMotorControl_t   g_foc_left_control = {
     .motor = &g_motor1,
     .velocity.speed_target_radps = 0.3f,
-    .current.iq_target = 0.3f,
+    .current.iq_target = 0.0f,
 };
 
 
@@ -125,7 +122,7 @@ CurrentSense_t          g_current_sense2; // 电流采样对象
 App_FOCMotorControl_t   g_foc_right_control = {
     .motor = &g_motor2,
     .velocity.speed_target_radps = 0.3f,
-    .current.iq_target = 0.3f,
+    .current.iq_target = 0.0f,
 };
 
 
@@ -165,7 +162,7 @@ float g_speed_fault1 = 0.0f;
 #define APP_SPEED_VEL_FAULT_ABS    (80.0f)
 
 
-#define APP_CURRENT_TARGET_A       (0.3f)
+#define APP_CURRENT_TARGET_A       (0.0f)
 #define APP_CURRENT_KP             (2.5)
 #define APP_CURRENT_KI             (0.2f)
 #define APP_CURRENT_KD             (0.0f)
@@ -180,7 +177,7 @@ float g_speed_fault1 = 0.0f;
 #define APP_CURRENT_FF_KD             (0.0f)
 #define APP_CURRENT_FF_I_LIMIT          (5.0f)
 
-#define APP_MOVE_DOWNSAMPLE        (1U)
+#define APP_MOVE_DOWNSAMPLE        (10U)
 
 
 #if (APP_MOVE_DOWNSAMPLE < 1U)
@@ -506,7 +503,8 @@ uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable)
 
     App_FOC_SetIqTarget(0.0f, 0.0f);
     App_ResetSpeedPIDs();
-    App_ResetCurrentPIDs();
+    App_ResetCurrentPIDs(&g_foc_left_control);
+    App_ResetCurrentPIDs(&g_foc_right_control);
 
     if (enable == 0U) {
         (void)App_Attitude_SetControlEnabled(0U);
@@ -870,10 +868,10 @@ static uint8_t App_InitMotor1Stack(void)
         USB_Debug_Printf("Motor_SetControlMode failed\r\n");
         return 0U;
     }
-    // if (!App_InitFOCAlgorithmT(&g_motor1)) {
-    //     USB_Debug_Printf("App_InitFOCAlgorithm failed\r\n");
-    //     return 0U;
-    // }
+    if (!App_InitFOCAlgorithm(&g_foc_left_control)) {
+        USB_Debug_Printf("App_InitFOCAlgorithm failed\r\n");
+        return 0U;
+    }
 #endif /* LEFT_MOTOR_ENABLE */
     return 1U;
 }
@@ -950,103 +948,20 @@ static uint8_t App_InitMotor2Stack(void)
         USB_Debug_Printf("FOCMotor_ConfigureState2 failed\r\n");
         return 0U;
     }
+    if (!Motor_SetControlMode(&g_motor2,
+                              motor_outer_torque,
+                              motor_inner_current)) {
+        USB_Debug_Printf("Motor_SetControlMode failed\r\n");
+        return 0U;
+    }
+    if (!App_InitFOCAlgorithm(&g_foc_right_control)) {
+        USB_Debug_Printf("App_InitFOCAlgorithm failed\r\n");
+        return 0U;
+    }
 #endif
     return 1U;
 }
 
-
-static uint8_t App_InitFOCAlgorithm(void)
-{
-    App_FOCMotorControl_t *left = &g_foc_left_control;
-    App_FOCMotorControl_t *right = &g_foc_right_control;
-
-    #if APP_SPEED_LOOP_ENABLE
-        /* 速度环 PID 初始化。当前速度环仍属于 V0.1 验证阶段 */
-        PID_ParameterInitEx(&left->velocity.speed_pid,
-                            APP_SPEED_KP,
-                            APP_SPEED_KI,
-                            APP_SPEED_KD,
-                            APP_SPEED_I_LIMIT,
-                            APP_SPEED_UQ_LIMIT,
-                            APP_SPEED_I_ERR_MIN,
-                            APP_SPEED_I_SEP_RATIO);
-
-        PID_ParameterInitEx(&right->velocity.speed_pid,
-                            APP_SPEED_KP,
-                            APP_SPEED_KI,
-                            APP_SPEED_KD,
-                            APP_SPEED_I_LIMIT,
-                            APP_SPEED_UQ_LIMIT,
-                            APP_SPEED_I_ERR_MIN,
-                            APP_SPEED_I_SEP_RATIO);
-
-        Left_Velocity_FOC_PID = left->velocity.speed_pid;
-        left->velocity.speed_target_radps = 0.3f;
-        right->velocity.speed_target_radps = 0.3f;
-        left->velocity.speed_meas_radps = 0.0f;
-        right->velocity.speed_meas_radps = 0.0f;
-        g_speed_fault1 = 0U;
-        g_speed_fault2 = 0U;
-
-        /* 速度反馈低通，当前截止频率 100Hz */
-        LowPassFilter_Init(&left->velocity.speed_lpf, 50.0f, FOC_FREQUENCY);
-        LowPassFilter_Init(&right->velocity.speed_lpf, 50.0f, FOC_FREQUENCY);
-    #endif
-
-
-    #if APP_CURRENT_LOOP_ENABLE
-        /* 前馈 PI 电流环参数组 */
-        PID_ParameterInitEx(&left->current.pid_ff,
-                            APP_CURRENT_FF_KP,
-                            APP_CURRENT_FF_KI,
-                            APP_CURRENT_FF_KD,
-                            APP_CURRENT_FF_I_LIMIT,
-                            APP_CURRENT_OUT_LIMIT,
-                            APP_CURRENT_I_ERR_MIN,
-                            CURRENT_LOOP_I_SEP_RATIO);
-
-        PID_ParameterInitEx(&right->current.pid_ff,
-                            APP_CURRENT_FF_KP,
-                            APP_CURRENT_FF_KI,
-                            APP_CURRENT_FF_KD,
-                            APP_CURRENT_FF_I_LIMIT,
-                            APP_CURRENT_OUT_LIMIT,
-                            APP_CURRENT_I_ERR_MIN,
-                            CURRENT_LOOP_I_SEP_RATIO);
-
-        /* 纯 PI 对照参数组，保留用于实验对比 */
-        PID_ParameterInitEx(&left->current.pid_pi,
-                            5.3f,
-                            0.62f,
-                            0.0f,
-                            APP_CURRENT_PURE_PI_I_LIMIT,
-                            11.0f,
-                            0.05f,
-                            CURRENT_LOOP_PURE_PI_I_SEP_RATIO);
-
-        PID_ParameterInitEx(&right->current.pid_pi,
-                            5.3f,
-                            0.62f,
-                            0.0f,
-                            APP_CURRENT_PURE_PI_I_LIMIT,
-                            11.0f,
-                            0.05f,
-                            CURRENT_LOOP_PURE_PI_I_SEP_RATIO);
-
-        /* 电流反馈低通，当前截止频率 800Hz */
-        LowPassFilter_Init(&left->current.current_lpf, 800.0f, FOC_FREQUENCY);
-        LowPassFilter_Init(&right->current.current_lpf, 800.0f, FOC_FREQUENCY);
-        left->current.iq_target = APP_CURRENT_TARGET_A;
-        right->current.iq_target = APP_CURRENT_TARGET_A;
-        left->current.iq_ref = 0.0f;
-        right->current.iq_ref = 0.0f;
-        left->current.iq_meas = 0.0f;
-        right->current.iq_meas = 0.0f;
-
-        App_ResetCurrentPIDs();
-    #endif
-        return 1U;
-}
 
 static void App_FOC_ForcePowerStageOff(void)
 {
@@ -1063,52 +978,81 @@ static void App_FOC_ForcePowerStageOff(void)
 
 
 
-static void App_ResetOuterLoopState(void)
+static void App_ResetOuterLoopState(App_FOCMotorControl_t *control)
 {
-    PID_Reset(&g_foc_left_control.velocity.speed_pid);
-    PID_Reset(&g_foc_right_control.velocity.speed_pid);
+    if (control == NULL) {
+        return;
+    }
+
+    PID_Reset(&control->velocity.speed_pid);
 }
 
 
-static uint8_t App_ConfigureLoopController(Motor_t *motor,
-                                                MotorOuterLoopMode_t outer_loop)
+static uint8_t App_ConfigureLoopController(App_FOCMotorControl_t *control,
+                                           MotorOuterLoopMode_t outer_loop)
 {
-    if (motor == NULL) {
+    Motor_t *motor;
+
+    if (control == NULL) {
         return 0U;
     }
 
+    motor = control->motor;
+    if (motor == NULL) {
+        return 0U;
+    }
+    /* 速度反馈低通，当前截止频率 50Hz */
+    LowPassFilter_Init(&control->velocity.speed_lpf, 50.0f, FOC_FREQUENCY);
+    PID_Reset(&control->velocity.speed_pid);
+    LowPassFilter_Reset(&control->velocity.speed_lpf);
+    control->velocity.speed_meas_radps = 0.0f;
     switch (outer_loop)
     {
+
     case motor_outer_torque:
-        App_ResetOuterLoopState();
-        if (motor->config.inner_loop == motor_inner_current) {
-            PID_ParameterInitEx(&g_foc_left_control.current.pid_ff,
-                                APP_CURRENT_FF_KP, APP_CURRENT_FF_KI, APP_CURRENT_FF_KD,
-                                APP_CURRENT_FF_I_LIMIT,
-                                APP_CURRENT_OUT_LIMIT,
-                                APP_CURRENT_I_ERR_MIN,
-                                CURRENT_LOOP_I_SEP_RATIO);
-            PID_Reset(&g_foc_left_control.current.pid_ff);
-            LowPassFilter_Reset(&g_foc_left_control.velocity.speed_lpf);
-            return 1U;
+        App_ResetOuterLoopState(control);
+        if (motor->config.inner_loop == motor_inner_voltage) 
+        {
+
+        }
+        if (motor->config.inner_loop == motor_inner_current) 
+        {
+
+        }
+        return 1U;
 
     case motor_outer_velocity:
-        if (motor->sensor == NULL) {
+        if (motor->sensor == NULL) 
+        {
             USB_Debug_Printf("FOC velocity mode needs sensor\r\n");
             return 0U;
         }
 #if FOC_ENABLE_VELOCITY_LOOP
-        if (motor->config.inner_loop == motor_inner_voltage) {
-            PID_ParameterInitEx(&g_foc_left_control.velocity.speed_pid,
-                                0.8f, 0.025f, 0.0f,
-                                Uq_max,
-                                Uq_max,
-                                0.05f,
-                                0.8f);
-            PID_Reset(&g_foc_left_control.velocity.speed_pid);
-            LowPassFilter_Reset(&g_foc_left_control.velocity.speed_lpf);
-            g_speed_meas_f1 = 0.0f;
-            return 1U;
+        if (motor->config.inner_loop == motor_inner_current) 
+        {
+
+        /* 速度环 PID 初始化。当前速度环仍属于 V0.1 验证阶段 */
+            PID_ParameterInitEx(&control->velocity.speed_pid,
+                                APP_SPEED_KP,
+                                APP_SPEED_KI,
+                                APP_SPEED_KD,
+                                APP_SPEED_I_LIMIT,
+                                APP_SPEED_UQ_LIMIT,
+                                APP_SPEED_I_ERR_MIN,
+                                APP_SPEED_I_SEP_RATIO);
+
+        if (control == &g_foc_left_control) {
+            Left_Velocity_FOC_PID = control->velocity.speed_pid;
+            g_speed_fault1 = 0U;
+        } else if (control == &g_foc_right_control) {
+            g_speed_fault2 = 0U;
+        }
+
+        control->velocity.speed_target_radps = 0.0f;
+        control->velocity.speed_meas_radps = 0.0f;
+
+      
+        return 1U;
         }
 #endif
         USB_Debug_Printf("velocity current inner loop not implemented\r\n");
@@ -1142,7 +1086,7 @@ static uint8_t App_ConfigureLoopController(Motor_t *motor,
             return 0U;
         }
 
-        App_ResetOuterLoopState();
+        App_ResetOuterLoopState(control);
         return 1U;
 
     default:
@@ -1152,26 +1096,20 @@ static uint8_t App_ConfigureLoopController(Motor_t *motor,
 
 
 
-static uint8_t App_InitFOCAlgorithmT(Motor_t *motor)
+static uint8_t App_InitFOCAlgorithm(App_FOCMotorControl_t *control)
 {
-    App_FOCMotorControl_t *control = NULL;
+    Motor_t *motor;
 
-    if(motor == NULL){
+    if (control == NULL) {
+        return 0U;
+    }
+    motor = control->motor;
+    if (motor == NULL) {
         return 0U;
     }
     if (motor->driver == NULL) {
         return 0U;
     }
-
-    if (motor == &g_motor1) {
-        control = &g_foc_left_control;
-    } else if (motor == &g_motor2) {
-        control = &g_foc_right_control;
-    } else {
-        return 0U;
-    }
-
-    LowPassFilter_Init(&control->velocity.speed_lpf, 50.0f, FOC_FREQUENCY);
 
     switch (motor->config.inner_loop)
     {
@@ -1186,6 +1124,27 @@ static uint8_t App_InitFOCAlgorithmT(Motor_t *motor)
             USB_Debug_Printf("FOC current mode needs current_sense\r\n");
             return 0U;
         }
+        PID_ParameterInitEx(&control->current.pid_ff,
+                            APP_CURRENT_FF_KP, APP_CURRENT_FF_KI, APP_CURRENT_FF_KD,
+                            APP_CURRENT_FF_I_LIMIT,
+                            APP_CURRENT_OUT_LIMIT,
+                            APP_CURRENT_I_ERR_MIN,
+                            CURRENT_LOOP_I_SEP_RATIO);
+        PID_ParameterInitEx(&control->current.pid_pi,
+                            5.3f,
+                            0.62f,
+                            0.0f,
+                            APP_CURRENT_PURE_PI_I_LIMIT,
+                            11.0f,
+                            0.05f,
+                            CURRENT_LOOP_PURE_PI_I_SEP_RATIO);
+        PID_Reset(&control->current.pid_ff);
+        PID_Reset(&control->current.pid_pi);
+        LowPassFilter_Reset(&control->velocity.speed_lpf);
+        LowPassFilter_Init(&control->current.current_lpf, 800.0f, FOC_FREQUENCY);
+        control->current.iq_target = APP_CURRENT_TARGET_A;
+        control->current.iq_ref = 0.0f;
+        control->current.iq_meas = 0.0f;
 #else
         USB_Debug_Printf("FOC current mode disabled by macro\r\n");
         return 0U;
@@ -1196,5 +1155,9 @@ static uint8_t App_InitFOCAlgorithmT(Motor_t *motor)
         return 0U;
     }
 
-    return App_ConfigureLoopController(motor, motor->config.outer_loop);
+#if APP_CURRENT_LOOP_ENABLE
+    App_ResetCurrentPIDs(control);
+#endif
+
+    return App_ConfigureLoopController(control, motor->config.outer_loop);
 }

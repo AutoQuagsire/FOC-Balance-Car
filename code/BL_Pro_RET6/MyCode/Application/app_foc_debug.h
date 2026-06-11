@@ -2,6 +2,7 @@
 #define APP_FOC_DEBUG_H
 
 #include <stdint.h>
+#include "app_foc_control.h"
 
 #define APP_FASTRING_SIZE (512U)
 
@@ -57,7 +58,7 @@ uint8_t App_CurrentPID_GetIErrMin(float *i_err_min);
 uint8_t App_CurrentPID_SetISepRatio(float i_sep_ratio);
 uint8_t App_CurrentPID_GetISepRatio(float *i_sep_ratio);
 
-void App_ResetCurrentPIDs(void);
+void App_ResetCurrentPIDs(App_FOCMotorControl_t *control);
 
 void App_ResetFastRing(void);
 void App_GetFastRingStatus(uint16_t *count,
