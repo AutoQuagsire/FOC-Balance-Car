@@ -88,13 +88,6 @@ uint8_t App_FOCStack_Init(void)
 
 
 
-/* 这些外设句柄由 CubeMX 生成并在别处定义
- * 这里用 extern 引用，供应用层初始化时使用 */
-extern SPI_HandleTypeDef hspi3;
-extern TIM_HandleTypeDef htim1;
-
-extern SPI_HandleTypeDef hspi1;
-extern TIM_HandleTypeDef htim4;
 /* =========================
  * 应用层 FOC 对象
  * =========================
@@ -1012,7 +1005,6 @@ uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable)
     App_ResetCurrentPIDs(&g_foc_right_control);
 
     if (enable == 0U) {
-        (void)App_Attitude_SetControlEnabled(0U);
         App_FOC_ForcePowerStageOff();
     } else {
 #if LEFT_MOTOR_ENABLE
