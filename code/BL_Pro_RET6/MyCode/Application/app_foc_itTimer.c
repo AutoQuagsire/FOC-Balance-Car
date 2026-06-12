@@ -17,9 +17,6 @@ uint8_t App_FOCControlIT_Enable(TIM_HandleTypeDef *htim)
         return 0U;
     }
 
-    /* Startup calibration may leave the driver disabled again. Re-enable it here. */
-    FOCMotor_enable(&g_motor1);
-    FOCMotor_enable(&g_motor2);
     if (HAL_TIM_Base_Start_IT(g_foc.g_foc_it_timer) != HAL_OK) {
         g_foc_control_it_enabled = 0U;
         return 0U;

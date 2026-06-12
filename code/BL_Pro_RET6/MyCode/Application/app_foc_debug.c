@@ -138,7 +138,7 @@ void App_FOC_GetTelemetry(App_FOCTelemetry_t *telemetry)
     flags |= APP_FOC_STATUS_FLAG_CURRENT_LOOP_ENABLED;
 #endif
 
-    if (g_foc_power_stage_enabled == 0U) {
+    if (g_foc_system_enabled == 0U) {
         flags |= APP_FOC_STATUS_FLAG_POWER_STAGE_OFF;
     }
     if (App_Attitude_IsControlEnabled() != 0U) {
@@ -450,7 +450,7 @@ static uint16_t app_fastring_status_flags_snapshot(void)
     status |= APP_FOC_STATUS_FLAG_SPEED_LOOP_ENABLED;
     status |= APP_FOC_STATUS_FLAG_CURRENT_LOOP_ENABLED;
 
-    if (g_foc_power_stage_enabled == 0U) {
+    if (g_foc_system_enabled == 0U) {
         status |= APP_FOC_STATUS_FLAG_POWER_STAGE_OFF;
     }
     if (App_Attitude_IsControlEnabled() != 0U) {

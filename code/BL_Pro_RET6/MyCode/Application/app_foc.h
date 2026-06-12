@@ -29,8 +29,8 @@ void DebuginWhile(void);
 void App_ResetSpeedPIDs(void);
 void App_FOC_SetIqTarget(float left_iq, float right_iq);
 float App_FOC_GetAverageWheelSpeedRadps(void);
-uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable);
-uint8_t App_FOC_IsPowerStageEnabled(void);
+uint8_t App_FOC_SetSystemEnabled(uint8_t enable);
+uint8_t App_FOC_IsSystemEnabled(void);
 uint8_t App_FOC_SetDriverGateEnabled(uint8_t enable);
 
 /* DebugLink 用的状态变量 */

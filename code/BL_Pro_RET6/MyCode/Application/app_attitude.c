@@ -228,7 +228,7 @@ uint8_t App_Attitude_SetControlEnabled(uint8_t enable)
         return 0U;
     }
 
-    if ((enable != 0U) && (App_FOC_IsPowerStageEnabled() == 0U)) {
+    if ((enable != 0U) && (App_FOC_IsSystemEnabled() == 0U)) {
         return 0U;
     }
 

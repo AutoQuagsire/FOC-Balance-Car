@@ -41,7 +41,7 @@ uint8_t DebugLinkApp_SetPowerStageEnabled(uint8_t enable)
         (void)App_Attitude_SetControlEnabled(0U);
     }
 
-    return (App_FOC_SetPowerStageEnabled(enable) != 0U) ?
+    return (App_FOC_SetSystemEnabled(enable) != 0U) ?
         DEBUG_LINK_APP_RESULT_OK : DEBUG_LINK_APP_RESULT_BUSY;
 }
 

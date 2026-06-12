@@ -26,7 +26,7 @@
 #endif
 
 extern volatile uint8_t g_foc_stack_ready;
-extern volatile uint8_t g_foc_power_stage_enabled;
+extern volatile uint8_t g_foc_system_enabled;
 extern uint8_t g_bus_voltage_valid;
 extern float g_bus_voltage_filtered;
 extern volatile uint8_t g_foc_control_it_enabled;

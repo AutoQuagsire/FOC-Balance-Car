@@ -33,10 +33,10 @@ static uint8_t App_InitMotor2Stack(void);
 static uint8_t App_InitFOCAlgorithm(App_FOCMotorControl_t *control);
 static uint8_t App_ConfigureLoopController(App_FOCMotorControl_t *control,
                                            MotorOuterLoopMode_t outer_loop);
-static void App_FOC_ForcePowerStageOff(void);
+static void App_FOC_ForceMotorsDisable(void);
 
 volatile uint8_t g_foc_stack_ready = 0U;
-volatile uint8_t g_foc_power_stage_enabled = 0U;
+volatile uint8_t g_foc_system_enabled = 0U;
 
 /* FOC timing state shared by the SimpleFOC compatibility layer. */
 FocFrequency_t g_foc = {
@@ -77,7 +77,7 @@ uint8_t App_FOCStack_Init(void)
         return 0U;
     }
 
-    App_FOC_ForcePowerStageOff();
+    App_FOC_ForceMotorsDisable();
     App_ResetFastRing();
     g_foc_stack_ready = 1U;
     USB_Debug_Printf("FOC stack init ok\r\n");
@@ -486,7 +486,7 @@ static uint8_t loopFOC(void)
         }
 #endif
 
-        if (g_foc_power_stage_enabled != 0U) {
+        if (g_foc_system_enabled != 0U) {
             Motor_SetPhaseVoltageQBySinCos(&g_motor1, Uq_cmd1, sin_e1, cos_e1);
             Motor_SetPhaseVoltageQBySinCos(&g_motor2, Uq_cmd2, sin_e2, cos_e2);
         } else {
@@ -754,7 +754,7 @@ static uint8_t App_InitMotor2Stack(void)
 }
 
 
-static void App_FOC_ForcePowerStageOff(void)
+static void App_FOC_ForceMotorsDisable(void)
 {
 #if LEFT_MOTOR_ENABLE
     FOCMotor_disable(&g_motor1);
@@ -763,7 +763,7 @@ static void App_FOC_ForcePowerStageOff(void)
     FOCMotor_disable(&g_motor2);
 #endif
 
-    g_foc_power_stage_enabled = 0U;
+    g_foc_system_enabled = 0U;
 }
 
 
@@ -978,7 +978,7 @@ float App_FOC_GetAverageWheelSpeedRadps(void)
                    (APP_RIGHT_WHEEL_SPEED_SIGN * right_speed));
 }
 
-uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable)
+uint8_t App_FOC_SetSystemEnabled(uint8_t enable)
 {
     uint8_t should_restore_tim5_irq = 0U;
 
@@ -1005,7 +1005,7 @@ uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable)
     App_ResetCurrentPIDs(&g_foc_right_control);
 
     if (enable == 0U) {
-        App_FOC_ForcePowerStageOff();
+        App_FOC_ForceMotorsDisable();
     } else {
 #if LEFT_MOTOR_ENABLE
         FOCMotor_enable(&g_motor1);
@@ -1013,7 +1013,7 @@ uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable)
 #if RIGHT_MOTOR_ENABLE
         FOCMotor_enable(&g_motor2);
 #endif
-        g_foc_power_stage_enabled = 1U;
+        g_foc_system_enabled = 1U;
     }
 
     if (should_restore_tim5_irq != 0U) {
@@ -1023,9 +1023,9 @@ uint8_t App_FOC_SetPowerStageEnabled(uint8_t enable)
     return 1U;
 }
 
-uint8_t App_FOC_IsPowerStageEnabled(void)
+uint8_t App_FOC_IsSystemEnabled(void)
 {
-    return g_foc_power_stage_enabled;
+    return g_foc_system_enabled;
 }
 
 uint8_t App_FOC_SetDriverGateEnabled(uint8_t enable)
