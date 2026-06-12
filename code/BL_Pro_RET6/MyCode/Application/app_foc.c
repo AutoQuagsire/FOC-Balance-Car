@@ -152,8 +152,6 @@ float g_speed_fault1 = 0.0f;
 #define APP_SPEED_I_SEP_RATIO      (0.75f)
 
 
-#define APP_CURRENT_TARGET_A       (0.0f)
-
 #define APP_LEFT_WHEEL_SPEED_SIGN   (1.0f)
 #define APP_RIGHT_WHEEL_SPEED_SIGN  (-1.0f)
 
@@ -932,7 +930,7 @@ static uint8_t App_InitFOCAlgorithm(App_FOCMotorControl_t *control)
         PID_Reset(&control->current.pid_pi);
         LowPassFilter_Reset(&control->velocity.speed_lpf);
         LowPassFilter_Init(&control->current.current_lpf, 800.0f, FOC_FREQUENCY);
-        control->current.iq_target = APP_CURRENT_TARGET_A;
+        control->current.iq_target = 0.0f;
         control->current.iq_ref = 0.0f;
         control->current.iq_meas = 0.0f;
 #else
