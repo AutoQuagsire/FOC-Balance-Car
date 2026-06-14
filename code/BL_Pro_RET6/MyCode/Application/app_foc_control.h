@@ -25,8 +25,8 @@ typedef struct {
 
 typedef struct {
     Motor_t *motor;
-    VelocityCube_t velocity;
-    CurrentCube_t current;
+    VelocityCube_t velocity_control;
+    CurrentCube_t current_control;
 } App_FOCMotorControl_t;
 
 extern App_FOCMotorControl_t g_foc_left_control;

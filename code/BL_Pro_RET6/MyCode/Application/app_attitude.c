@@ -1,10 +1,9 @@
 #include "app_attitude.h"
 
-#include <math.h>
 #include <string.h>
 
 #include "INT.h"
-#include "PID.h"
+#include "app_attitude_internal.h"
 #include "app_foc.h"
 #include "stm32g4xx_hal.h"
 #include "usb_debug.h"
@@ -46,7 +45,9 @@
 #define APP_TEST_PITCH_TARGET_DELTA_RAD      (APP_TEST_PITCH_TARGET_DELTA_DEG * APP_DEG2RAD)
 
 #define APP_SPEED_TARGET_RADPS               (0.0f)
-#define APP_SPEED_LOOP_SIGN                  (-1.0f)
+#define APP_SPEED_MEAS_SIGN                  (-1.0f)
+#define APP_SETIQ_LEFT_SIGN                  (1.0f)
+#define APP_SETIQ_RIGHT_SIGN                 (-1.0f)
 
 #define APP_DEF_ATTITUDE_KP_A_PER_RAD        (9.4f)
 #define APP_DEF_ATTITUDE_KD_A_PER_RADPS      (0.26f)
@@ -77,53 +78,6 @@
 #define APP_SPEED_I_FREEZE_RATE_RADPS        (10.0f * APP_DEG2RAD)
 #define APP_SPEED_STAGE_SOFTSTART_FREEZE_SEC (0.30f)
 
-/*
- * Fast A/B sign test switch.
- *
- * 0: baseline
- * 1: flip attitude iq sign only
- * 2: swap left/right iq mapping only
- * 3: flip speed measurement sign only
- * 4: (1) + (3)
- * 5: (2) + (3)
- */
-#define APP_ATTITUDE_AB_MODE                 (0U)
-
-#if (APP_ATTITUDE_AB_MODE == 0U)
-#define APP_TEST_SPEED_MEAS_SIGN             (-1.0f)
-#define APP_TEST_ATTITUDE_IQ_SIGN            (APP_ATTITUDE_IQ_SIGN)
-#define APP_TEST_SETIQ_LEFT_SIGN             (1.0f)
-#define APP_TEST_SETIQ_RIGHT_SIGN            (-1.0f)
-#elif (APP_ATTITUDE_AB_MODE == 1U)
-#define APP_TEST_SPEED_MEAS_SIGN             (-1.0f)
-#define APP_TEST_ATTITUDE_IQ_SIGN            (-APP_ATTITUDE_IQ_SIGN)
-#define APP_TEST_SETIQ_LEFT_SIGN             (1.0f)
-#define APP_TEST_SETIQ_RIGHT_SIGN            (-1.0f)
-#elif (APP_ATTITUDE_AB_MODE == 2U)
-#define APP_TEST_SPEED_MEAS_SIGN             (-1.0f)
-#define APP_TEST_ATTITUDE_IQ_SIGN            (APP_ATTITUDE_IQ_SIGN)
-#define APP_TEST_SETIQ_LEFT_SIGN             (-1.0f)
-#define APP_TEST_SETIQ_RIGHT_SIGN            (1.0f)
-#elif (APP_ATTITUDE_AB_MODE == 3U)
-#define APP_TEST_SPEED_MEAS_SIGN             (1.0f)
-#define APP_TEST_ATTITUDE_IQ_SIGN            (APP_ATTITUDE_IQ_SIGN)
-#define APP_TEST_SETIQ_LEFT_SIGN             (1.0f)
-#define APP_TEST_SETIQ_RIGHT_SIGN            (-1.0f)
-#elif (APP_ATTITUDE_AB_MODE == 4U)
-#define APP_TEST_SPEED_MEAS_SIGN             (1.0f)
-#define APP_TEST_ATTITUDE_IQ_SIGN            (-APP_ATTITUDE_IQ_SIGN)
-#define APP_TEST_SETIQ_LEFT_SIGN             (1.0f)
-#define APP_TEST_SETIQ_RIGHT_SIGN            (-1.0f)
-#elif (APP_ATTITUDE_AB_MODE == 5U)
-#define APP_TEST_SPEED_MEAS_SIGN             (1.0f)
-#define APP_TEST_ATTITUDE_IQ_SIGN            (APP_ATTITUDE_IQ_SIGN)
-#define APP_TEST_SETIQ_LEFT_SIGN             (-1.0f)
-#define APP_TEST_SETIQ_RIGHT_SIGN            (1.0f)
-#else
-#error "APP_ATTITUDE_AB_MODE out of range"
-#endif
-
-
 /* ICM42688 底层设备句柄 */
 static ICM42688_Handle_t g_icm42688;
 
@@ -145,32 +99,174 @@ IMU_PhysData_t g_phys_data;
  */
 static volatile uint8_t g_attitude_init_ready = 0U;
 static volatile uint8_t g_attitude_control_enabled = 0U;
-static float g_speed_loop_integral = 0.0f;
-static volatile App_AttitudeTelemetry_t g_attitude_telemetry;
-static PID_t g_speed_pitch_pid;
-static volatile float g_speed_kp_rad_per_radps = APP_DEF_SPEED_KP_RAD_PER_RADPS;
-static volatile float g_speed_ki_rad_per_rad = APP_DEF_SPEED_KI_RAD_PER_RAD;
-static volatile float g_speed_pitch_limit_rad = APP_DEF_SPEED_PITCH_LIMIT_RAD;
-static volatile float g_speed_unwind_gain = APP_DEF_SPEED_UNWIND_GAIN;
-static volatile float g_attitude_kp_a_per_rad = APP_DEF_ATTITUDE_KP_A_PER_RAD;
-static volatile float g_attitude_kd_a_per_radps = APP_DEF_ATTITUDE_KD_A_PER_RADPS;
-static volatile float g_attitude_iq_limit_a = APP_DEF_ATTITUDE_IQ_LIMIT_A;
-static volatile float g_attitude_shutdown_rad = APP_DEF_ATTITUDE_SHUTDOWN_RAD;
+volatile App_AttitudeTelemetry_t g_attitude_telemetry;
+App_AttitudeControl_t g_attitude_control;
 
-static float App_Attitude_ClampFloat(float value, float min_value, float max_value);
-static uint8_t App_Attitude_IsFiniteInRange(float value, float min_value, float max_value);
-static void App_Attitude_ApplySpeedPidParams(uint8_t reset_runtime);
+/*
+ * 姿态控制关闭时，重置对外输出的遥测快照。
+ *
+ * 清零上一拍残留的控制量和测量量，保留当前目标值与限幅配置，
+ * 让 stream / GUI 看到稳定、可解释的关闭态。
+ */
+static void App_AttitudeTelemetry_ResetForDisabled(void)
+{
+    __disable_irq();
+    g_attitude_telemetry.pitch_target_rad = 0.0f;
+    g_attitude_telemetry.speed_p_term_rad = 0.0f;
+    g_attitude_telemetry.speed_i_term_rad = 0.0f;
+    g_attitude_telemetry.speed_target_radps = g_attitude_control.Speed_Control.target_radps;
+    g_attitude_telemetry.speed_meas_radps = 0.0f;
+    g_attitude_telemetry.speed_raw_radps = 0.0f;
+    g_attitude_telemetry.attitude_p_term_a = 0.0f;
+    g_attitude_telemetry.attitude_d_term_a = 0.0f;
+    g_attitude_telemetry.iq_cmd_a = 0.0f;
+    g_attitude_telemetry.iq_cmd_clamped_a = 0.0f;
+    g_attitude_telemetry.speed_output_limit_rad = g_attitude_control.Speed_Control.pid.output_limit;
+    g_attitude_telemetry.attitude_output_limit_a = g_attitude_control.attitude_control.output_limit;
+    __enable_irq();
+}
+
+
+void App_Attitude_ApplyPidParams(uint8_t reset_runtime)
+{
+    if (reset_runtime != 0U) {
+        g_attitude_control.Speed_Control.pid.Kp = APP_DEF_SPEED_KP_RAD_PER_RADPS;
+        g_attitude_control.Speed_Control.pid.Ki = APP_DEF_SPEED_KI_RAD_PER_RAD;
+        g_attitude_control.Speed_Control.pid.Kd = 0.0f;
+        g_attitude_control.Speed_Control.target_radps = APP_SPEED_TARGET_RADPS;
+        g_attitude_control.Speed_Control.pid.output_limit = APP_DEF_SPEED_PITCH_LIMIT_RAD;
+        g_attitude_control.Speed_Control.pid.unwind_gain = APP_DEF_SPEED_UNWIND_GAIN;
+        g_attitude_control.attitude_control.kp = APP_DEF_ATTITUDE_KP_A_PER_RAD;
+        g_attitude_control.attitude_control.kd = APP_DEF_ATTITUDE_KD_A_PER_RADPS;
+        g_attitude_control.attitude_control.output_limit = APP_DEF_ATTITUDE_IQ_LIMIT_A;
+        g_attitude_control.attitude_control.shutdown_limit = APP_DEF_ATTITUDE_SHUTDOWN_RAD;
+        PID_Reset(&g_attitude_control.Speed_Control.pid);
+    }
+
+    g_attitude_control.Speed_Control.pid.integral_limit = APP_DEF_SPEED_I_LIMIT_RAD;
+    g_attitude_control.Speed_Control.pid.I_ERR_MIN = APP_DEF_SPEED_I_ERR_MIN_RADPS;
+    g_attitude_control.Speed_Control.pid.I_SEP_RATIO = APP_DEF_SPEED_I_SEP_RATIO;
+}
+
 static float App_Attitude_CalculatePitchTarget(float wheel_speed_radps,
                                                float dt,
                                                uint8_t freeze_integral,
                                                float *pitch_target_p,
-                                               float *pitch_target_i);
+                                               float *pitch_target_i)
+{
+    float pitch_target_p_term;
+    float pitch_target_i_term;
+
+    /*
+     * PID_Calculate() uses error = target - measure. With the confirmed
+     * convention (positive speed is forward, larger pitch target drives
+     * forward), this gives the same control direction as the previous
+     * APP_SPEED_LOOP_SIGN = -1 path, but keeps P/I telemetry signed exactly
+     * like the real output.
+     */
+    PID_CalculateDt(&g_attitude_control.Speed_Control.pid,
+                    g_attitude_control.Speed_Control.target_radps,
+                    wheel_speed_radps,
+                    dt,
+                    freeze_integral);
+
+    pitch_target_p_term = g_attitude_control.Speed_Control.pid.Kp *
+                          g_attitude_control.Speed_Control.pid.last_error;
+    pitch_target_i_term = g_attitude_control.Speed_Control.pid.Ki *
+                          g_attitude_control.Speed_Control.pid.error_integral;
+
+    if (pitch_target_p != NULL) {
+        *pitch_target_p = pitch_target_p_term;
+    }
+
+    if (pitch_target_i != NULL) {
+        *pitch_target_i = pitch_target_i_term;
+    }
+
+    return g_attitude_control.Speed_Control.pid.output;
+}
+
+static float App_Attitude_ClampFloat(float value, float min_value, float max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+
+    if (value > max_value) {
+        return max_value;
+    }
+
+    return value;
+}
+
 static float App_Attitude_CalculateIqCommand(float pitch_target_rad,
                                              float pitch_rad,
                                              float pitch_rate_radps,
                                              float *iq_cmd_p,
                                              float *iq_cmd_d,
-                                             float *iq_cmd_clamped);
+                                             float *iq_cmd_clamped)
+{
+    float pitch_error;
+    float pitch_rate_error;
+    float iq_cmd;
+    float iq_cmd_limited;
+    float iq_cmd_p_term;
+    float iq_cmd_d_term;
+
+    pitch_error = pitch_target_rad - pitch_rad;
+    pitch_rate_error = APP_ATTITUDE_PITCH_RATE_TARGET_RADPS - pitch_rate_radps;
+
+    if (fabsf(pitch_rad) > g_attitude_control.attitude_control.shutdown_limit) {
+        PID_Reset(&g_attitude_control.Speed_Control.pid);
+
+        if (iq_cmd_p != NULL) {
+            *iq_cmd_p = 0.0f;
+        }
+
+        if (iq_cmd_d != NULL) {
+            *iq_cmd_d = 0.0f;
+        }
+
+        if (iq_cmd_clamped != NULL) {
+            *iq_cmd_clamped = 0.0f;
+        }
+
+        return 0.0f;
+    }
+
+    /*
+     * 原始姿态环：
+     *
+     *   iq_cmd = P + D
+     *
+     * APP_ATTITUDE_IQ_SIGN 用于匹配姿态环定义方向和电机正方向。
+     */
+    iq_cmd_p_term = g_attitude_control.attitude_control.kp * pitch_error;
+    iq_cmd_d_term = g_attitude_control.attitude_control.kd * pitch_rate_error;
+
+    iq_cmd_p_term *= APP_ATTITUDE_IQ_SIGN;
+    iq_cmd_d_term *= APP_ATTITUDE_IQ_SIGN;
+
+    iq_cmd = iq_cmd_p_term + iq_cmd_d_term;
+
+    iq_cmd_limited = App_Attitude_ClampFloat(iq_cmd,
+                                             -g_attitude_control.attitude_control.output_limit,
+                                             g_attitude_control.attitude_control.output_limit);
+
+    if (iq_cmd_p != NULL) {
+        *iq_cmd_p = iq_cmd_p_term;
+    }
+
+    if (iq_cmd_d != NULL) {
+        *iq_cmd_d = iq_cmd_d_term;
+    }
+
+    if (iq_cmd_clamped != NULL) {
+        *iq_cmd_clamped = iq_cmd_limited;
+    }
+
+    return iq_cmd_limited;
+}
 
 /**
  * @brief  姿态模块初始化
@@ -189,18 +285,10 @@ uint8_t App_Attitude_Init(void)
     memset(&g_estimator, 0, sizeof(g_estimator));
     memset(&g_phys_data, 0, sizeof(g_phys_data));
     memset((void *)&g_attitude_telemetry, 0, sizeof(g_attitude_telemetry));
+    memset(&g_attitude_control, 0, sizeof(g_attitude_control));
     g_attitude_init_ready = 0U;
     g_attitude_control_enabled = 0U;
-    g_speed_loop_integral = 0.0f;
-    g_speed_kp_rad_per_radps = APP_DEF_SPEED_KP_RAD_PER_RADPS;
-    g_speed_ki_rad_per_rad = APP_DEF_SPEED_KI_RAD_PER_RAD;
-    g_speed_pitch_limit_rad = APP_DEF_SPEED_PITCH_LIMIT_RAD;
-    g_speed_unwind_gain = APP_DEF_SPEED_UNWIND_GAIN;
-    g_attitude_kp_a_per_rad = APP_DEF_ATTITUDE_KP_A_PER_RAD;
-    g_attitude_kd_a_per_radps = APP_DEF_ATTITUDE_KD_A_PER_RADPS;
-    g_attitude_iq_limit_a = APP_DEF_ATTITUDE_IQ_LIMIT_A;
-    g_attitude_shutdown_rad = APP_DEF_ATTITUDE_SHUTDOWN_RAD;
-    App_Attitude_ApplySpeedPidParams(1U);
+    App_Attitude_ApplyPidParams(1U);
 
     /* 将具体 IMU 设备实例绑定到 estimator */
     Estimator_LinkICM42688P(&g_icm42688, &g_estimator);
@@ -234,25 +322,11 @@ uint8_t App_Attitude_SetControlEnabled(uint8_t enable)
 
     __disable_irq();
     g_attitude_control_enabled = enable;
-    g_speed_loop_integral = 0.0f;
-    PID_Reset(&g_speed_pitch_pid);
+    PID_Reset(&g_attitude_control.Speed_Control.pid);
     __enable_irq();
 
     if (enable == 0U) {
-        __disable_irq();
-        g_attitude_telemetry.pitch_target_rad = 0.0f;
-        g_attitude_telemetry.speed_p_term_rad = 0.0f;
-        g_attitude_telemetry.speed_i_term_rad = 0.0f;
-        g_attitude_telemetry.speed_target_radps = APP_SPEED_TARGET_RADPS;
-        g_attitude_telemetry.speed_meas_radps = 0.0f;
-        g_attitude_telemetry.speed_raw_radps = 0.0f;
-        g_attitude_telemetry.attitude_p_term_a = 0.0f;
-        g_attitude_telemetry.attitude_d_term_a = 0.0f;
-        g_attitude_telemetry.iq_cmd_a = 0.0f;
-        g_attitude_telemetry.iq_cmd_clamped_a = 0.0f;
-        g_attitude_telemetry.speed_output_limit_rad = g_speed_pitch_limit_rad;
-        g_attitude_telemetry.attitude_output_limit_a = g_attitude_iq_limit_a;
-        __enable_irq();
+        App_AttitudeTelemetry_ResetForDisabled();
         App_FOC_SetIqTarget(0.0f, 0.0f);
     }
 
@@ -470,8 +544,7 @@ void App_Attitude_Loop(void)
         speed_softstart_sec = 0.0f;
         speed_integral_freeze = 1U;
 #endif
-        g_speed_loop_integral = 0.0f;
-        PID_Reset(&g_speed_pitch_pid);
+        PID_Reset(&g_attitude_control.Speed_Control.pid);
         speed_raw_radps = wheel_speed_radps;
         __disable_irq();
         g_attitude_telemetry.pitch_target_rad = 0.0f;
@@ -479,15 +552,15 @@ void App_Attitude_Loop(void)
         g_attitude_telemetry.speed_i_term_rad = 0.0f;
         g_attitude_telemetry.pitch_meas_rad = pitch_meas_rad;
         g_attitude_telemetry.pitch_rate_meas_radps = pitch_rate_meas_radps;
-        g_attitude_telemetry.speed_target_radps = APP_SPEED_TARGET_RADPS;
-        g_attitude_telemetry.speed_meas_radps = APP_TEST_SPEED_MEAS_SIGN * wheel_speed_radps;
+        g_attitude_telemetry.speed_target_radps = g_attitude_control.Speed_Control.target_radps;
+        g_attitude_telemetry.speed_meas_radps = APP_SPEED_MEAS_SIGN * wheel_speed_radps;
         g_attitude_telemetry.speed_raw_radps = speed_raw_radps;
         g_attitude_telemetry.attitude_p_term_a = 0.0f;
         g_attitude_telemetry.attitude_d_term_a = 0.0f;
         g_attitude_telemetry.iq_cmd_a = 0.0f;
         g_attitude_telemetry.iq_cmd_clamped_a = 0.0f;
-        g_attitude_telemetry.speed_output_limit_rad = g_speed_pitch_limit_rad;
-        g_attitude_telemetry.attitude_output_limit_a = g_attitude_iq_limit_a;
+        g_attitude_telemetry.speed_output_limit_rad = g_attitude_control.Speed_Control.pid.output_limit;
+        g_attitude_telemetry.attitude_output_limit_a = g_attitude_control.attitude_control.output_limit;
         __enable_irq();
         App_FOC_SetIqTarget(0.0f, 0.0f);
         return;
@@ -497,8 +570,8 @@ void App_Attitude_Loop(void)
     {
         SpeedPID_Count = 0U;
         wheel_speed_radps = App_FOC_GetAverageWheelSpeedRadps();
-        speed_meas_radps = APP_TEST_SPEED_MEAS_SIGN * wheel_speed_radps;
-        speed_error_radps_last = APP_SPEED_TARGET_RADPS - speed_meas_radps;
+        speed_meas_radps = APP_SPEED_MEAS_SIGN * wheel_speed_radps;
+        speed_error_radps_last = g_attitude_control.Speed_Control.target_radps - speed_meas_radps;
 
 #if (APP_SPEED_EXPERIMENT_SCHEME == APP_SPEED_SCHEME_TWO_STAGE)
         float abs_pitch_rad = fabsf(pitch_meas_rad);
@@ -512,8 +585,7 @@ void App_Attitude_Loop(void)
             speed_p_term_rad_last = 0.0f;
             speed_i_term_rad_last = 0.0f;
             speed_pitch_target_slew_rad = 0.0f;
-            g_speed_loop_integral = 0.0f;
-            PID_Reset(&g_speed_pitch_pid);
+            PID_Reset(&g_attitude_control.Speed_Control.pid);
         } else {
             if (speed_loop_enabled == 0U) {
                 speed_loop_enabled = 1U;
@@ -544,14 +616,15 @@ void App_Attitude_Loop(void)
                                                              &speed_i_term_rad_last);
 #endif
     } else {
-        speed_meas_radps = APP_TEST_SPEED_MEAS_SIGN * wheel_speed_radps;
+        speed_meas_radps = APP_SPEED_MEAS_SIGN * wheel_speed_radps;
     }
 
     speed_raw_radps = wheel_speed_radps;
     speed_p_term_rad = speed_p_term_rad_last;
     speed_i_term_rad = speed_i_term_rad_last;
     speed_error_radps = speed_error_radps_last;
-    speed_i_integral_term_rad = g_speed_ki_rad_per_rad * g_speed_loop_integral;
+    speed_i_integral_term_rad = g_attitude_control.Speed_Control.pid.Ki *
+                                g_attitude_control.Speed_Control.pid.error_integral;
 #if APP_SPEED_OUTPUT_SLEW_ENABLE
     speed_pitch_target_slew_rad = PID_SlewLimit(speed_pitch_target_slew_rad,
                                                 pitch_target_rad,
@@ -581,18 +654,18 @@ void App_Attitude_Loop(void)
     g_attitude_telemetry.speed_i_term_rad = speed_i_term_rad;
     g_attitude_telemetry.pitch_meas_rad = pitch_meas_rad;
     g_attitude_telemetry.pitch_rate_meas_radps = pitch_rate_meas_radps;
-    g_attitude_telemetry.speed_target_radps = APP_SPEED_TARGET_RADPS;
+    g_attitude_telemetry.speed_target_radps = g_attitude_control.Speed_Control.target_radps;
     g_attitude_telemetry.speed_meas_radps = speed_meas_radps;
     g_attitude_telemetry.speed_raw_radps = speed_raw_radps;
     g_attitude_telemetry.attitude_p_term_a = attitude_p_term_a;
     g_attitude_telemetry.attitude_d_term_a = attitude_d_term_a;
     g_attitude_telemetry.iq_cmd_a = iq_cmd_a;
     g_attitude_telemetry.iq_cmd_clamped_a = iq_cmd_clamped_a;
-    g_attitude_telemetry.speed_output_limit_rad = g_speed_pitch_limit_rad;
-    g_attitude_telemetry.attitude_output_limit_a = g_attitude_iq_limit_a;
+    g_attitude_telemetry.speed_output_limit_rad = g_attitude_control.Speed_Control.pid.output_limit;
+    g_attitude_telemetry.attitude_output_limit_a = g_attitude_control.attitude_control.output_limit;
     __enable_irq();
-    App_FOC_SetIqTarget(APP_TEST_SETIQ_LEFT_SIGN * iq_cmd_clamped_a,
-                        APP_TEST_SETIQ_RIGHT_SIGN * iq_cmd_clamped_a);
+    App_FOC_SetIqTarget(APP_SETIQ_LEFT_SIGN * iq_cmd_clamped_a,
+                        APP_SETIQ_RIGHT_SIGN * iq_cmd_clamped_a);
 
 
 
@@ -633,7 +706,7 @@ void App_Attitude_Loop(void)
                      wheel_speed_radps,
                      speed_meas_radps,
                      speed_error_radps,
-                     g_speed_loop_integral,
+                     g_attitude_control.Speed_Control.pid.error_integral,
                      speed_i_integral_term_rad,
                      iq_cmd_clamped_a,
                      g_estimator.kalman_pitch.acc_norm);
@@ -646,451 +719,8 @@ void App_Attitude_Loop(void)
 
 
 
-float App_Attitude_GetPitch()
-{
-    return Estimator_GetPitch(&g_estimator);
-}
-
-float  App_Attitude_GetPitchRate(void)
-{   
-    return Estimator_GetPitchRate(&g_estimator);
-}
-
-void App_Attitude_GetTelemetry(App_AttitudeTelemetry_t *telemetry)
-{
-    if (telemetry == NULL) {
-        return;
-    }
-
-    __disable_irq();
-    *telemetry = g_attitude_telemetry;
-    __enable_irq();
-}
-
-uint8_t App_Attitude_IsReady(void)
-{
-    return g_attitude_init_ready;
-}
 
 uint8_t App_Attitude_IsControlEnabled(void)
 {
     return g_attitude_control_enabled;
-}
-
-uint8_t App_Attitude_SetSpeedKp(float value)
-{
-    if (App_Attitude_IsFiniteInRange(value, 0.0f, 1000.0f) == 0U) {
-        return 0U;
-    }
-    __disable_irq();
-    g_speed_kp_rad_per_radps = value;
-    App_Attitude_ApplySpeedPidParams(0U);
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_GetSpeedKp(float *value)
-{
-    if (value == NULL) {
-        return 0U;
-    }
-    __disable_irq();
-    *value = g_speed_kp_rad_per_radps;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_SetSpeedKi(float value)
-{
-    if (App_Attitude_IsFiniteInRange(value, 0.0f, 1000.0f) == 0U) {
-        return 0U;
-    }
-    __disable_irq();
-    g_speed_ki_rad_per_rad = value;
-    App_Attitude_ApplySpeedPidParams(0U);
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_GetSpeedKi(float *value)
-{
-    if (value == NULL) {
-        return 0U;
-    }
-    __disable_irq();
-    *value = g_speed_ki_rad_per_rad;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_SetSpeedPitchLimitRad(float value)
-{
-    if (App_Attitude_IsFiniteInRange(value, 0.001f, 3.2f) == 0U) {
-        return 0U;
-    }
-    __disable_irq();
-    g_speed_pitch_limit_rad = value;
-    App_Attitude_ApplySpeedPidParams(0U);
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_GetSpeedPitchLimitRad(float *value)
-{
-    if (value == NULL) {
-        return 0U;
-    }
-    __disable_irq();
-    *value = g_speed_pitch_limit_rad;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_SetSpeedUnwindGain(float value)
-{
-    if (App_Attitude_IsFiniteInRange(value, 0.1f, 20.0f) == 0U) {
-        return 0U;
-    }
-    __disable_irq();
-    g_speed_unwind_gain = value;
-    App_Attitude_ApplySpeedPidParams(0U);
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_GetSpeedUnwindGain(float *value)
-{
-    if (value == NULL) {
-        return 0U;
-    }
-    __disable_irq();
-    *value = g_speed_unwind_gain;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_SetAttitudeKp(float value)
-{
-    if (App_Attitude_IsFiniteInRange(value, 0.0f, 1000.0f) == 0U) {
-        return 0U;
-    }
-    __disable_irq();
-    g_attitude_kp_a_per_rad = value;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_GetAttitudeKp(float *value)
-{
-    if (value == NULL) {
-        return 0U;
-    }
-    __disable_irq();
-    *value = g_attitude_kp_a_per_rad;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_SetAttitudeKd(float value)
-{
-    if (App_Attitude_IsFiniteInRange(value, 0.0f, 1000.0f) == 0U) {
-        return 0U;
-    }
-    __disable_irq();
-    g_attitude_kd_a_per_radps = value;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_GetAttitudeKd(float *value)
-{
-    if (value == NULL) {
-        return 0U;
-    }
-    __disable_irq();
-    *value = g_attitude_kd_a_per_radps;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_SetAttitudeIqLimit(float value)
-{
-    if (App_Attitude_IsFiniteInRange(value, 0.001f, 1000.0f) == 0U) {
-        return 0U;
-    }
-    __disable_irq();
-    g_attitude_iq_limit_a = value;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_GetAttitudeIqLimit(float *value)
-{
-    if (value == NULL) {
-        return 0U;
-    }
-    __disable_irq();
-    *value = g_attitude_iq_limit_a;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_SetAttitudeShutdownRad(float value)
-{
-    if (App_Attitude_IsFiniteInRange(value, 0.001f, 3.2f) == 0U) {
-        return 0U;
-    }
-    __disable_irq();
-    g_attitude_shutdown_rad = value;
-    __enable_irq();
-    return 1U;
-}
-
-uint8_t App_Attitude_GetAttitudeShutdownRad(float *value)
-{
-    if (value == NULL) {
-        return 0U;
-    }
-    __disable_irq();
-    *value = g_attitude_shutdown_rad;
-    __enable_irq();
-    return 1U;
-}
-
-static float App_Attitude_ClampFloat(float value, float min_value, float max_value)
-{
-    if (value < min_value) {
-        return min_value;
-    }
-
-    if (value > max_value) {
-        return max_value;
-    }
-
-    return value;
-}
-
-static uint8_t App_Attitude_IsFiniteInRange(float value, float min_value, float max_value)
-{
-    if (!isfinite(value)) {
-        return 0U;
-    }
-    if ((value < min_value) || (value > max_value)) {
-        return 0U;
-    }
-    return 1U;
-}
-
-static void App_Attitude_ApplySpeedPidParams(uint8_t reset_runtime)
-{
-    g_speed_pitch_pid.Kp = g_speed_kp_rad_per_radps;
-    g_speed_pitch_pid.Ki = g_speed_ki_rad_per_rad;
-    g_speed_pitch_pid.Kd = 0.0f;
-    g_speed_pitch_pid.integral_limit = APP_DEF_SPEED_I_LIMIT_RAD;
-    g_speed_pitch_pid.output_limit = g_speed_pitch_limit_rad;
-    g_speed_pitch_pid.I_ERR_MIN = APP_DEF_SPEED_I_ERR_MIN_RADPS;
-    g_speed_pitch_pid.I_SEP_RATIO = APP_DEF_SPEED_I_SEP_RATIO;
-    g_speed_pitch_pid.unwind_gain = g_speed_unwind_gain;
-
-    if (reset_runtime != 0U) {
-        PID_Reset(&g_speed_pitch_pid);
-        g_speed_loop_integral = 0.0f;
-    }
-}
-
-static float App_Attitude_CalculatePitchTarget(float wheel_speed_radps,
-                                               float dt,
-                                               uint8_t freeze_integral,
-                                               float *pitch_target_p,
-                                               float *pitch_target_i)
-{
-    float pitch_target_p_term;
-    float pitch_target_i_term;
-
-    /*
-     * PID_Calculate() uses error = target - measure. With the confirmed
-     * convention (positive speed is forward, larger pitch target drives
-     * forward), this gives the same control direction as the previous
-     * APP_SPEED_LOOP_SIGN = -1 path, but keeps P/I telemetry signed exactly
-     * like the real output.
-     */
-    PID_CalculateDt(&g_speed_pitch_pid,
-                    APP_SPEED_TARGET_RADPS,
-                    wheel_speed_radps,
-                    dt,
-                    freeze_integral);
-
-    pitch_target_p_term = g_speed_pitch_pid.Kp * g_speed_pitch_pid.last_error;
-    pitch_target_i_term = g_speed_pitch_pid.Ki * g_speed_pitch_pid.error_integral;
-
-    g_speed_loop_integral = g_speed_pitch_pid.error_integral;
-    if (pitch_target_p != NULL) {
-        *pitch_target_p = pitch_target_p_term;
-    }
-
-    if (pitch_target_i != NULL) {
-        *pitch_target_i = pitch_target_i_term;
-    }
-
-    return g_speed_pitch_pid.output;
-
-#if 0
-
-    /*
-     * 速度定义：
-     *   wheel_speed_radps > 0  向前
-     *   wheel_speed_radps < 0  向后
-     *
-     * 运动关系：
-     *   pitch_target 增大 -> 向前
-     *
-     * 所以速度环输出需要反向：
-     *   APP_SPEED_LOOP_SIGN = -1.0f
-     */
-    speed_error = wheel_speed_radps - APP_SPEED_TARGET_RADPS;
-
-    if (dt <= 0.0f) {
-        dt = 0.0f;
-    }
-
-    /*
-     * P 项
-     */
-    pitch_target_p_term = g_speed_kp_rad_per_radps * speed_error;
-
-    /*
-     * I 项
-     */
-    if (g_speed_ki_rad_per_rad != 0.0f) {
-        g_speed_loop_integral += speed_error * dt;
-
-        /*
-         * 对积分状态本身限幅，避免 windup。
-         * 因为：
-         *   pitch_i = Ki * integral
-         * 所以：
-         *   integral_limit = pitch_limit / Ki
-         */
-        integral_limit = g_speed_pitch_limit_rad / fabsf(g_speed_ki_rad_per_rad);
-
-        g_speed_loop_integral = App_Attitude_ClampFloat(g_speed_loop_integral,
-                                                        -integral_limit,
-                                                        integral_limit);
-
-        pitch_target_i_term = g_speed_ki_rad_per_rad * g_speed_loop_integral;
-    } else {
-        g_speed_loop_integral = 0.0f;
-        pitch_target_i_term = 0.0f;
-    }
-
-    /*
-     * 速度环原始输出。
-     * 注意这里统一乘 APP_SPEED_LOOP_SIGN。
-     *
-     * 当前应设置：
-     *   #define APP_SPEED_LOOP_SIGN  (-1.0f)
-     */
-    pitch_target_raw = APP_SPEED_LOOP_SIGN *
-                       (pitch_target_p_term + pitch_target_i_term);
-
-    /*
-     * 速度环目标角限幅。
-     * 这个返回值是“相对平衡角的修正量”，
-     * 外部应这样叠加：
-     *
-     *   pitch_target_cmd_rad = APP_BALANCE_PITCH_OFFSET_RAD
-     *                        + speed_pitch_target_rad
-     *                        + APP_TEST_PITCH_TARGET_DELTA_RAD;
-     */
-    pitch_target_limited = App_Attitude_ClampFloat(pitch_target_raw,
-                                                   -g_speed_pitch_limit_rad,
-                                                   g_speed_pitch_limit_rad);
-
-    /*
-     * 日志输出实际参与控制方向后的 P/I 项。
-     */
-    if (pitch_target_p != NULL) {
-        *pitch_target_p = APP_SPEED_LOOP_SIGN * pitch_target_p_term;
-    }
-
-    if (pitch_target_i != NULL) {
-        *pitch_target_i = APP_SPEED_LOOP_SIGN * pitch_target_i_term;
-    }
-
-    return pitch_target_limited;
-#endif
-}
-
-static float App_Attitude_CalculateIqCommand(float pitch_target_rad,
-                                             float pitch_rad,
-                                             float pitch_rate_radps,
-                                             float *iq_cmd_p,
-                                             float *iq_cmd_d,
-                                             float *iq_cmd_clamped)
-{
-    float pitch_error;
-    float pitch_rate_error;
-    float iq_cmd;
-    float iq_cmd_limited;
-    float iq_cmd_p_term;
-    float iq_cmd_d_term;
-
-    pitch_error = pitch_target_rad - pitch_rad;
-    pitch_rate_error = APP_ATTITUDE_PITCH_RATE_TARGET_RADPS - pitch_rate_radps;
-
-    if (fabsf(pitch_rad) > g_attitude_shutdown_rad) {
-        g_speed_loop_integral = 0.0f;
-        PID_Reset(&g_speed_pitch_pid);
-
-        if (iq_cmd_p != NULL) {
-            *iq_cmd_p = 0.0f;
-        }
-
-        if (iq_cmd_d != NULL) {
-            *iq_cmd_d = 0.0f;
-        }
-
-        if (iq_cmd_clamped != NULL) {
-            *iq_cmd_clamped = 0.0f;
-        }
-
-        return 0.0f;
-    }
-
-    /*
-     * 原始姿态环：
-     *
-     *   iq_cmd = P + D
-     *
-     * 当前为了验证姿态环执行方向，使用 APP_TEST_ATTITUDE_IQ_SIGN 反向。
-     *
-     * 当 APP_TEST_ATTITUDE_IQ_SIGN = -1.0f 时：
-     *
-     *   iq_cmd = -(P + D)
-     */
-    iq_cmd_p_term = g_attitude_kp_a_per_rad * pitch_error;
-    iq_cmd_d_term = g_attitude_kd_a_per_radps * pitch_rate_error;
-
-    iq_cmd_p_term *= APP_TEST_ATTITUDE_IQ_SIGN;
-    iq_cmd_d_term *= APP_TEST_ATTITUDE_IQ_SIGN;
-
-    iq_cmd = iq_cmd_p_term + iq_cmd_d_term;
-
-    iq_cmd_limited = App_Attitude_ClampFloat(iq_cmd,
-                                             -g_attitude_iq_limit_a,
-                                             g_attitude_iq_limit_a);
-
-    if (iq_cmd_p != NULL) {
-        *iq_cmd_p = iq_cmd_p_term;
-    }
-
-    if (iq_cmd_d != NULL) {
-        *iq_cmd_d = iq_cmd_d_term;
-    }
-
-    if (iq_cmd_clamped != NULL) {
-        *iq_cmd_clamped = iq_cmd_limited;
-    }
-
-    return iq_cmd_limited;
 }

@@ -31,6 +31,7 @@
 #include "app_foc_debug.h"
 #include "app_foc_itTimer.h"
 #include "app_attitude.h"
+#include "app_attitude_debug.h"
 #include "usb_debug.h"
 #include "icm42688p.h"
 #include "debug_link.h"
@@ -188,7 +189,7 @@ int main(void)
 
     DebugLink_Process();
 
-    //DebuginWhile();
+
     //Process_USB_Command();
   }
   /* USER CODE END 3 */

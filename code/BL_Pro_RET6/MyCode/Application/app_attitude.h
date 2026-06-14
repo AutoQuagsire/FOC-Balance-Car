@@ -32,26 +32,6 @@ uint8_t App_Attitude_SetControlEnabled(uint8_t enable);
 void App_Attitude_OnDrdyExtiISR(void);
 void App_Attitude_OnSpi2DmaCpltISR(void);
 void App_Attitude_OnSpi2DmaErrorISR(void);
-float App_Attitude_GetPitch(void);
-float App_Attitude_GetPitchRate(void);
-void App_Attitude_GetTelemetry(App_AttitudeTelemetry_t *telemetry);
-uint8_t App_Attitude_IsReady(void);
 uint8_t App_Attitude_IsControlEnabled(void);
-uint8_t App_Attitude_SetSpeedKp(float value);
-uint8_t App_Attitude_GetSpeedKp(float *value);
-uint8_t App_Attitude_SetSpeedKi(float value);
-uint8_t App_Attitude_GetSpeedKi(float *value);
-uint8_t App_Attitude_SetSpeedPitchLimitRad(float value);
-uint8_t App_Attitude_GetSpeedPitchLimitRad(float *value);
-uint8_t App_Attitude_SetSpeedUnwindGain(float value);
-uint8_t App_Attitude_GetSpeedUnwindGain(float *value);
-uint8_t App_Attitude_SetAttitudeKp(float value);
-uint8_t App_Attitude_GetAttitudeKp(float *value);
-uint8_t App_Attitude_SetAttitudeKd(float value);
-uint8_t App_Attitude_GetAttitudeKd(float *value);
-uint8_t App_Attitude_SetAttitudeIqLimit(float value);
-uint8_t App_Attitude_GetAttitudeIqLimit(float *value);
-uint8_t App_Attitude_SetAttitudeShutdownRad(float value);
-uint8_t App_Attitude_GetAttitudeShutdownRad(float *value);
 
 #endif

@@ -154,7 +154,7 @@ float App_FOC_GetBusVoltageFiltered(void)
 
 uint8_t App_FOC_BusTelemetryInit(void)
 {
-    if (g_foc_stack_ready != 0U) {
+    if (g_foc_stack_init_ready != 0U) {
         s_last_bus_voltage_sample_tick_ms = HAL_GetTick();
         s_bus_telemetry_ready = 1U;
         return 1U;

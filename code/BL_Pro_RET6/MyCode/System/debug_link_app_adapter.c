@@ -1,6 +1,7 @@
 #include "debug_link_app_adapter.h"
 
 #include "app_attitude.h"
+#include "app_attitude_debug.h"
 #include "app_foc.h"
 #include "app_foc_debug.h"
 

@@ -95,15 +95,15 @@ void App_FOC_GetTelemetry(App_FOCTelemetry_t *telemetry)
     snapshot.status_flags = 0U;
 
     __disable_irq();
-    snapshot.wheel_vel_left_radps = g_foc_left_control.velocity.speed_meas_radps;
-    snapshot.wheel_vel_right_radps = g_foc_right_control.velocity.speed_meas_radps;
+    snapshot.wheel_vel_left_radps = g_foc_left_control.velocity_control.speed_meas_radps;
+    snapshot.wheel_vel_right_radps = g_foc_right_control.velocity_control.speed_meas_radps;
     snapshot.filtered_iq_left_a = g_current_loop_debug1.filtered_iq;
     snapshot.filtered_iq_right_a = g_current_loop_debug2.filtered_iq;
     snapshot.uq_left_v = g_current_loop_debug1.uq_final;
     snapshot.uq_right_v = g_current_loop_debug2.uq_final;
     snapshot.bus_voltage_v = g_bus_voltage_filtered;
     bus_valid = g_bus_voltage_valid;
-    stack_ready = g_foc_stack_ready;
+    stack_ready = g_foc_stack_init_ready;
     control_it_enabled = g_foc_control_it_enabled;
     loop_count = g_foc_loop_count;
     last_loop_tick_ms = g_foc_last_loop_tick_ms;
@@ -172,10 +172,10 @@ static void App_CurrentPIDApplyOne(PID_t *pid, float kp, float ki, float kd, flo
 static PID_t *App_CurrentPIDGetOneByMode(uint8_t mode)
 {
     if (mode == 0U) {
-        return &g_foc_left_control.current.pid_ff;
+        return &g_foc_left_control.current_control.pid_ff;
     }
 
-    return &g_foc_left_control.current.pid_pi;
+    return &g_foc_left_control.current_control.pid_pi;
 }
 
 static void App_CurrentPIDSelectPairByMode(uint8_t mode, PID_t **pid1, PID_t **pid2)
@@ -185,13 +185,13 @@ static void App_CurrentPIDSelectPairByMode(uint8_t mode, PID_t **pid1, PID_t **p
     }
 
     if (mode == 0U) {
-        *pid1 = &g_foc_left_control.current.pid_ff;
-        *pid2 = &g_foc_right_control.current.pid_ff;
+        *pid1 = &g_foc_left_control.current_control.pid_ff;
+        *pid2 = &g_foc_right_control.current_control.pid_ff;
         return;
     }
 
-    *pid1 = &g_foc_left_control.current.pid_pi;
-    *pid2 = &g_foc_right_control.current.pid_pi;
+    *pid1 = &g_foc_left_control.current_control.pid_pi;
+    *pid2 = &g_foc_right_control.current_control.pid_pi;
 }
 
 static void App_CurrentPIDReinitOneWithExisting(PID_t *pid,
@@ -414,14 +414,14 @@ void App_ResetCurrentPIDs(App_FOCMotorControl_t *control)
 
     __disable_irq();
 
-    App_PIDResetRuntime(&control->current.pid_ff);
-    App_PIDResetRuntime(&control->current.pid_pi);
+    App_PIDResetRuntime(&control->current_control.pid_ff);
+    App_PIDResetRuntime(&control->current_control.pid_pi);
 
     App_CurrentLoopDebugClear(debug);
 
     *i_unload_limit_ticks = 0U;
 
-    control->current.iq_ref = control->current.iq_target;
+    control->current_control.iq_ref = control->current_control.iq_target;
 
     __enable_irq();
 }
@@ -436,7 +436,7 @@ static uint16_t app_fastring_status_flags_snapshot(void)
     if (g_speed_fault2 > 0.5f) {
         status |= APP_FOC_STATUS_FLAG_SPEED_FAULT_R;
     }
-    if (g_foc_stack_ready != 0U) {
+    if (g_foc_stack_init_ready != 0U) {
         status |= APP_FOC_STATUS_FLAG_STACK_READY;
     }
     if (g_foc_control_it_enabled != 0U) {
