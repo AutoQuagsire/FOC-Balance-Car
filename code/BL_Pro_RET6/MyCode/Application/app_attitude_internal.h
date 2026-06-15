@@ -25,18 +25,4 @@
 extern volatile App_AttitudeTelemetry_t g_attitude_telemetry;
 extern App_AttitudeControl_t g_attitude_control;
 
-/*
- * 姿态模块内部参数同步入口。
- *
- * reset_runtime = 1:
- * - 装载姿态/速度环默认参数
- * - 同步速度环 PID 运行约束
- * - 清零速度环 PID 运行状态
- *
- * reset_runtime = 0:
- * - 保留当前调参结果
- * - 仅同步速度环 PID 运行约束
- */
-void App_Attitude_ApplyPidParams(uint8_t reset_runtime);
-
 #endif

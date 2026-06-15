@@ -10,6 +10,7 @@
  * Unit convention:
  * - pid:                     速度环 PID 参数与运行时状态
  * - target_radps:            rad/s
+ * - meas_radps:              rad/s
  */
 typedef struct
 {
@@ -25,6 +26,8 @@ typedef struct
  * - kp / kd:        按姿态环实际控制量定义
  * - output_limit:   A，姿态环输出的电流指令限幅
  * - shutdown_limit: rad
+ * - target_pitch_rad: rad
+ * - meas_pitch_rad:   rad
  */
 typedef struct
 {
@@ -32,7 +35,6 @@ typedef struct
     float kd;
     float output_limit;
     float shutdown_limit;
-
     float target_pitch_rad;
     float meas_pitch_rad;
 } AttitudeCube_t;

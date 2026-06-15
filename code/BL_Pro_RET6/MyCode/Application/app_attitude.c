@@ -29,41 +29,74 @@
 #define APP_ATTITUDE_DT_SEC 0.001f
 
 /*
- * First bring-up attitude loop parameters.
+ * 姿态/速度控制公共方向与单位基准。
  *
- * Unit convention:
- *  - pitch: rad
- *  - pitch_rate: rad/s
- *  - iq_cmd: A
+ * 这组常量用于统一：
+ * - 姿态环输出方向
+ * - 平衡点偏置
+ * - 角度单位换算
  */
-#define APP_ATTITUDE_PITCH_RATE_TARGET_RADPS (0.0f)
 #define APP_ATTITUDE_IQ_SIGN                 (1.0f)
 #define APP_BALANCE_PITCH_OFFSET_DEG         (0.6f)
 #define APP_DEG2RAD                          (0.01745329252f)
 #define APP_BALANCE_PITCH_OFFSET_RAD         (APP_BALANCE_PITCH_OFFSET_DEG * APP_DEG2RAD)
-#define APP_TEST_PITCH_TARGET_DELTA_DEG      (0.0f)
-#define APP_TEST_PITCH_TARGET_DELTA_RAD      (APP_TEST_PITCH_TARGET_DELTA_DEG * APP_DEG2RAD)
+
+/*
+ * 速度环目标与双电机方向约定。
+ *
+ * - APP_SPEED_TARGET_RADPS：速度环默认目标速度
+ * - APP_SPEED_MEAS_SIGN：轮速到车体前进方向的符号映射
+ * - APP_SETIQ_LEFT_SIGN / RIGHT_SIGN：同一电流指令分配到左右电机时的方向约定
+ */
 
 #define APP_SPEED_TARGET_RADPS               (0.0f)
 #define APP_SPEED_MEAS_SIGN                  (-1.0f)
 #define APP_SETIQ_LEFT_SIGN                  (1.0f)
 #define APP_SETIQ_RIGHT_SIGN                 (-1.0f)
 
-#define APP_DEF_ATTITUDE_KP_A_PER_RAD        (9.4f)
-#define APP_DEF_ATTITUDE_KD_A_PER_RADPS      (0.26f)
-#define APP_DEF_ATTITUDE_IQ_LIMIT_A          (1.6f)
-#define APP_DEF_ATTITUDE_SHUTDOWN_RAD        (2.0f)
-#define APP_DEF_SPEED_KP_RAD_PER_RADPS       (0.008f)
-#define APP_DEF_SPEED_KI_RAD_PER_RAD         (0.0015f)
-#define APP_DEF_SPEED_PITCH_LIMIT_RAD        (12.0f * APP_DEG2RAD)
-#define APP_DEF_SPEED_I_LIMIT_RAD            (0.4f * APP_DEG2RAD)
-#define APP_DEF_SPEED_I_ERR_MIN_RADPS        (50.0f)
-#define APP_DEF_SPEED_I_SEP_RATIO            (0.0f)
-#define APP_DEF_SPEED_UNWIND_GAIN            (5.0f)
+/*
+ * 速度环默认控制参数。
+ *
+ * - KP / KI：速度误差到目标倾角的比例与积分增益
+ * - PITCH_LIMIT：速度环输出的目标倾角限幅
+ * - I_LIMIT：积分项输出限幅
+ * - I_ERR_MIN / I_SEP_RATIO：积分分离范围控制
+ * - UNWIND_GAIN：积分反向卸载强度
+ */
+
+#define APP_SPEED_KP                     (0.008f)
+#define APP_SPEED_KI                     (0.0015f)
+#define APP_SPEED_OUTPUT_LIMIT           (12.0f * APP_DEG2RAD)
+#define APP_SPEED_I_LIMIT                (0.4f * APP_DEG2RAD)
+#define APP_SPEED_I_ERR_MIN              (50.0f)
+#define APP_SPEED_I_SEP_RATIO            (0.0f)
+#define APP_SPEED_UNWIND_GAIN            (5.0f)
+
+/*
+ * 速度环输出变化率控制。
+ *
+ * - ENABLE：是否启用目标倾角的斜率限制
+ * - RATE_DPS：每秒允许的最大倾角变化速度
+ * - STEP_RAD：换算到单次姿态循环的最大变化步长
+ * - LOOP_DT_SEC：速度环实际更新周期
+ */
 #define APP_SPEED_OUTPUT_SLEW_ENABLE         (1U)
 #define APP_SPEED_OUTPUT_SLEW_RATE_DPS       (120.0f)
 #define APP_SPEED_OUTPUT_SLEW_STEP_RAD       (APP_SPEED_OUTPUT_SLEW_RATE_DPS * APP_DEG2RAD * APP_ATTITUDE_DT_SEC)
 #define APP_SPEED_LOOP_DT_SEC                (APP_ATTITUDE_DT_SEC * 10.0f)
+
+/*
+ * 姿态环默认控制参数。
+ *
+ * - KP / KD：倾角误差与角速度误差到电流指令的增益
+ * - IQ_LIMIT：姿态环输出电流限幅
+ * - SHUTDOWN_RAD：超出该倾角后直接关闭姿态环输出
+ */
+
+#define APP_ATTITUDE_KP                    (9.4f)
+#define APP_ATTITUDE_KD                    (0.26f)
+#define APP_ATTITUDE_OUTPUT_LIMIT          (1.6f)
+#define APP_ATTITUDE_SHUTDOWN_RAD          (2.0f)
 
 /* Speed-loop A/B experiment switch.
  * 0: baseline (always-on speed loop)
@@ -76,7 +109,7 @@
 /* Two-stage thresholds/timers */
 #define APP_SPEED_STAGE_FALL_PITCH_RAD       (50.0f * APP_DEG2RAD)
 #define APP_SPEED_I_FREEZE_RATE_RADPS        (10.0f * APP_DEG2RAD)
-#define APP_SPEED_STAGE_SOFTSTART_FREEZE_SEC (0.30f)
+#define APP_SPEED_I_FREEZE_SOFTSTART_SEC     (0.30f)
 
 /* ICM42688 底层设备句柄 */
 static ICM42688_Handle_t g_icm42688;
@@ -124,28 +157,41 @@ static void App_AttitudeTelemetry_ResetForDisabled(void)
     g_attitude_telemetry.speed_output_limit_rad = g_attitude_control.Speed_Control.pid.output_limit;
     g_attitude_telemetry.attitude_output_limit_a = g_attitude_control.attitude_control.output_limit;
     __enable_irq();
+
+    g_attitude_control.Speed_Control.meas_radps = 0.0f;
+    g_attitude_control.attitude_control.target_pitch_rad = 0.0f;
+    g_attitude_control.attitude_control.meas_pitch_rad = 0.0f;
 }
 
 
-void App_Attitude_ApplyPidParams(uint8_t reset_runtime)
+/*
+ * 初始化速度环和姿态环的默认控制参数。
+ *
+ * g_attitude_control 已由 App_Attitude_Init() 清零，因此这里完成：
+ * 1. 装载速度环 PID 参数、约束和目标值
+ * 2. 装载姿态环 PD 参数与保护阈值
+ * 3. 清零速度环 PID 运行状态
+ */
+static void App_Attitude_InitControlParams(void)
 {
-    if (reset_runtime != 0U) {
-        g_attitude_control.Speed_Control.pid.Kp = APP_DEF_SPEED_KP_RAD_PER_RADPS;
-        g_attitude_control.Speed_Control.pid.Ki = APP_DEF_SPEED_KI_RAD_PER_RAD;
-        g_attitude_control.Speed_Control.pid.Kd = 0.0f;
-        g_attitude_control.Speed_Control.target_radps = APP_SPEED_TARGET_RADPS;
-        g_attitude_control.Speed_Control.pid.output_limit = APP_DEF_SPEED_PITCH_LIMIT_RAD;
-        g_attitude_control.Speed_Control.pid.unwind_gain = APP_DEF_SPEED_UNWIND_GAIN;
-        g_attitude_control.attitude_control.kp = APP_DEF_ATTITUDE_KP_A_PER_RAD;
-        g_attitude_control.attitude_control.kd = APP_DEF_ATTITUDE_KD_A_PER_RADPS;
-        g_attitude_control.attitude_control.output_limit = APP_DEF_ATTITUDE_IQ_LIMIT_A;
-        g_attitude_control.attitude_control.shutdown_limit = APP_DEF_ATTITUDE_SHUTDOWN_RAD;
-        PID_Reset(&g_attitude_control.Speed_Control.pid);
-    }
+    /* 速度环参数：速度误差 -> 目标倾角。 */
+    g_attitude_control.Speed_Control.pid.Kp = APP_SPEED_KP;
+    g_attitude_control.Speed_Control.pid.Ki = APP_SPEED_KI;
+    g_attitude_control.Speed_Control.pid.Kd = 0.0f;
+    g_attitude_control.Speed_Control.pid.integral_limit = APP_SPEED_I_LIMIT;
+    g_attitude_control.Speed_Control.pid.output_limit = APP_SPEED_OUTPUT_LIMIT;
+    g_attitude_control.Speed_Control.pid.I_ERR_MIN = APP_SPEED_I_ERR_MIN;
+    g_attitude_control.Speed_Control.pid.I_SEP_RATIO = APP_SPEED_I_SEP_RATIO;
+    g_attitude_control.Speed_Control.pid.unwind_gain = APP_SPEED_UNWIND_GAIN;
+    g_attitude_control.Speed_Control.target_radps = APP_SPEED_TARGET_RADPS;
 
-    g_attitude_control.Speed_Control.pid.integral_limit = APP_DEF_SPEED_I_LIMIT_RAD;
-    g_attitude_control.Speed_Control.pid.I_ERR_MIN = APP_DEF_SPEED_I_ERR_MIN_RADPS;
-    g_attitude_control.Speed_Control.pid.I_SEP_RATIO = APP_DEF_SPEED_I_SEP_RATIO;
+    /* 姿态环参数：倾角误差和角速度 -> 电流指令。 */
+    g_attitude_control.attitude_control.kp = APP_ATTITUDE_KP;
+    g_attitude_control.attitude_control.kd = APP_ATTITUDE_KD;
+    g_attitude_control.attitude_control.output_limit = APP_ATTITUDE_OUTPUT_LIMIT;
+    g_attitude_control.attitude_control.shutdown_limit = APP_ATTITUDE_SHUTDOWN_RAD;
+
+    PID_Reset(&g_attitude_control.Speed_Control.pid);
 }
 
 static float App_Attitude_CalculatePitchTarget(float wheel_speed_radps,
@@ -206,6 +252,7 @@ static float App_Attitude_CalculateIqCommand(float pitch_target_rad,
                                              float *iq_cmd_d,
                                              float *iq_cmd_clamped)
 {
+    const float pitch_rate_target = 0.0f;
     float pitch_error;
     float pitch_rate_error;
     float iq_cmd;
@@ -214,7 +261,7 @@ static float App_Attitude_CalculateIqCommand(float pitch_target_rad,
     float iq_cmd_d_term;
 
     pitch_error = pitch_target_rad - pitch_rad;
-    pitch_rate_error = APP_ATTITUDE_PITCH_RATE_TARGET_RADPS - pitch_rate_radps;
+    pitch_rate_error = pitch_rate_target - pitch_rate_radps;
 
     if (fabsf(pitch_rad) > g_attitude_control.attitude_control.shutdown_limit) {
         PID_Reset(&g_attitude_control.Speed_Control.pid);
@@ -288,7 +335,7 @@ uint8_t App_Attitude_Init(void)
     memset(&g_attitude_control, 0, sizeof(g_attitude_control));
     g_attitude_init_ready = 0U;
     g_attitude_control_enabled = 0U;
-    App_Attitude_ApplyPidParams(1U);
+    App_Attitude_InitControlParams();
 
     /* 将具体 IMU 设备实例绑定到 estimator */
     Estimator_LinkICM42688P(&g_icm42688, &g_estimator);
@@ -309,6 +356,8 @@ uint8_t App_Attitude_Init(void)
     g_attitude_init_ready = 1U;
     return IMU_OK;
 }
+
+
 
 uint8_t App_Attitude_SetControlEnabled(uint8_t enable)
 {
@@ -332,7 +381,6 @@ uint8_t App_Attitude_SetControlEnabled(uint8_t enable)
 
     return 1U;
 }
-
 
 
 
@@ -530,6 +578,7 @@ void App_Attitude_Loop(void)
 
     pitch_meas_rad = Estimator_GetPitch(&g_estimator);
     pitch_rate_meas_radps = Estimator_GetPitchRate(&g_estimator);
+    g_attitude_control.attitude_control.meas_pitch_rad = pitch_meas_rad;
 
     if (g_attitude_control_enabled == 0U) {
         SpeedPID_Count = 0U;
@@ -546,6 +595,8 @@ void App_Attitude_Loop(void)
 #endif
         PID_Reset(&g_attitude_control.Speed_Control.pid);
         speed_raw_radps = wheel_speed_radps;
+        g_attitude_control.Speed_Control.meas_radps = APP_SPEED_MEAS_SIGN * wheel_speed_radps;
+        g_attitude_control.attitude_control.target_pitch_rad = 0.0f;
         __disable_irq();
         g_attitude_telemetry.pitch_target_rad = 0.0f;
         g_attitude_telemetry.speed_p_term_rad = 0.0f;
@@ -571,6 +622,7 @@ void App_Attitude_Loop(void)
         SpeedPID_Count = 0U;
         wheel_speed_radps = App_FOC_GetAverageWheelSpeedRadps();
         speed_meas_radps = APP_SPEED_MEAS_SIGN * wheel_speed_radps;
+        g_attitude_control.Speed_Control.meas_radps = speed_meas_radps;
         speed_error_radps_last = g_attitude_control.Speed_Control.target_radps - speed_meas_radps;
 
 #if (APP_SPEED_EXPERIMENT_SCHEME == APP_SPEED_SCHEME_TWO_STAGE)
@@ -593,7 +645,7 @@ void App_Attitude_Loop(void)
                 speed_integral_freeze = 1U;
             }
 
-            if (speed_softstart_sec < APP_SPEED_STAGE_SOFTSTART_FREEZE_SEC) {
+            if (speed_softstart_sec < APP_SPEED_I_FREEZE_SOFTSTART_SEC) {
                 speed_softstart_sec += APP_SPEED_LOOP_DT_SEC;
                 speed_integral_freeze = 1U;
             } else if (abs_pitch_rate_radps > APP_SPEED_I_FREEZE_RATE_RADPS) {
@@ -617,6 +669,7 @@ void App_Attitude_Loop(void)
 #endif
     } else {
         speed_meas_radps = APP_SPEED_MEAS_SIGN * wheel_speed_radps;
+        g_attitude_control.Speed_Control.meas_radps = speed_meas_radps;
     }
 
     speed_raw_radps = wheel_speed_radps;
@@ -635,8 +688,8 @@ void App_Attitude_Loop(void)
 #endif
 
     pitch_target_cmd_rad = APP_BALANCE_PITCH_OFFSET_RAD +
-                        speed_pitch_target_slew_rad +
-                        APP_TEST_PITCH_TARGET_DELTA_RAD;
+                        speed_pitch_target_slew_rad ;
+    g_attitude_control.attitude_control.target_pitch_rad = pitch_target_cmd_rad;
 #if !APP_ATTITUDE_USB_DEBUG_ENABLE
     (void)speed_error_radps;
     (void)speed_i_integral_term_rad;
