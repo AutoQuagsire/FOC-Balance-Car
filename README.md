@@ -49,37 +49,6 @@
 | 姿态环 | 1 kHz |
 | 速度环 | 100 Hz |
 
-## Control Architecture
-
-```mermaid
-flowchart TD
-    ENC[AS5047P Encoder] --> SPD[Speed Estimation]
-    SPD --> SPI[Speed PI\n100 Hz]
-    SPI --> PREF[Pitch Reference]
-
-    IMU[ICM42688] --> ATT[Attitude Estimation]
-    ATT --> APD[Attitude PD\n1 kHz]
-    PREF --> APD
-
-    APD --> IQREF[Iq Reference]
-    CS[Two-shunt Current Sense] --> IQ[Iq Calculation]
-    IQ --> CUR[Current Loop\nFF + PI @ 10 kHz]
-    IQREF --> CUR
-
-    ENC --> EA[Electrical Angle]
-    EA --> FOC[FOC / SVPWM\n20 kHz PWM]
-    CUR --> FOC
-    FOC --> M[Dual Motors]
-```
-
-主控制链为：
-
-```text
-速度 PI → 目标俯仰角 → 姿态 PD → Iq_ref → 电流前馈 + PI → FOC / SVPWM
-```
-
-编码器机械角经方向处理和极对数换算得到电角度；每次上电执行零位标定后进入闭环控制。
-
 ## Hardware
 
 <p align="center">
