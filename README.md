@@ -1,4 +1,4 @@
-+# FOC-Balance-Car
+ FOC-Balance-Car
 
 基于 **STM32G474** 的双电机 FOC 自平衡车控制平台。
 
