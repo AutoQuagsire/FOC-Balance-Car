@@ -18,3 +18,4 @@ right.csv
 compile_commands.json
 stream_data.zip
 .claude/settings.local.json
+code/Arduino-FOC-2.4.0/
