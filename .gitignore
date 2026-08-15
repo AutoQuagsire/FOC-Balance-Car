@@ -19,3 +19,6 @@ compile_commands.json
 stream_data.zip
 .claude/settings.local.json
 code/Arduino-FOC-2.4.0/
+code/BL_Pro_RET6/DebugLink_Progress.md
+code/BL_Pro_RET6/DebugLink_Protocol_V1.md
+code/BL_Pro_RET6/FOC_CurrentLoop_Parameters.md
