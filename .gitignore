@@ -11,3 +11,10 @@ code/BL_Pro_RET6/tools/pysidedeploy.spec
 code/dist_nuitka.zip
 left.csv
 right.csv
+
+# Local and build-generated files
+*.map
+*.lst
+compile_commands.json
+stream_data.zip
+.claude/settings.local.json

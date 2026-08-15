@@ -1,3 +1,3 @@
 {
-    "cmake.sourceDirectory": "C:/Users/Lenovo/Documents/GitHub/-bot-/code/BL_Pro_RET6"
+    "cmake.sourceDirectory": "${workspaceFolder}/code/BL_Pro_RET6"
 }
