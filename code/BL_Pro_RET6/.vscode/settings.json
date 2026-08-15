@@ -14,5 +14,5 @@
         "--query-driver=${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-g++*"
     ]
     ,
-    "stm32.programmerPath": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe"
+    "stm32.programmerPath": "${env:STM32_PROGRAMMER_CLI}"
 }
